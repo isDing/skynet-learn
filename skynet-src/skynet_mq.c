@@ -19,17 +19,19 @@
 #define MQ_OVERLOAD 1024
 
 struct message_queue {
+	// 自旋锁，可能存在多个线程，向同一个队列写入的情况，加上自旋锁避免并发带来的发现，
 	struct spinlock lock;
-	uint32_t handle;
-	int cap;
-	int head;
-	int tail;
-	int release;
-	int in_global;
-	int overload;
+
+	uint32_t handle;		// 拥有此消息队列的服务的id
+	int cap;				// 消息大小
+	int head;				// 头部index
+	int tail;				// 尾部index
+	int release;			// 是否能释放消息
+	int in_global;			// 是否在全局消息队列中，0表示不是，1表示是
+	int overload;			// 是否过载
 	int overload_threshold;
-	struct skynet_message *queue;
-	struct message_queue *next;
+	struct skynet_message *queue;	// 消息队列
+	struct message_queue *next;		// 下一个次级消息队列的指针
 };
 
 struct global_queue {
@@ -153,6 +155,8 @@ skynet_mq_pop(struct message_queue *q, struct skynet_message *message) {
 		if (length < 0) {
 			length += cap;
 		}
+		// 过载检测，这个机制可以让 Skynet 在日志中打印出服务阻塞或堆积严重的警告，帮助定位性能瓶颈。
+		// 在 skynet_context_message_dispatch 时调用 skynet_mq_overload
 		while (length > q->overload_threshold) {
 			q->overload = length;
 			q->overload_threshold *= 2;

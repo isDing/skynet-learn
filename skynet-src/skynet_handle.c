@@ -12,22 +12,23 @@
 #define DEFAULT_SLOT_SIZE 4
 #define MAX_SLOT_SIZE 0x40000000
 
+// 这个结构用于记录，服务对应的别名，当应用层为某个服务命名时，会写到这里来
 struct handle_name {
-	char * name;
-	uint32_t handle;
+	char * name;        // 服务别名
+	uint32_t handle;    // 服务id
 };
 
 struct handle_storage {
-	struct rwlock lock;
+	struct rwlock lock;         // 读写锁
 
-	uint32_t harbor;
-	uint32_t handle_index;
-	int slot_size;
-	struct skynet_context ** slot;
+	uint32_t harbor;            // harbor id (分布式节点 ID，放在 handle 高位)
+	uint32_t handle_index;      // 下一个尝试分配的 handle 序号
+	int slot_size;              // 哈希表槽数，2^n，初始是 4，可动态扩容
+	struct skynet_context ** slot;  // 存放服务上下文指针的数组
 
-	int name_cap;
-	int name_count;
-	struct handle_name *name;
+	int name_cap;               // 别名列表大小，大小为2^n
+	int name_count;             // 别名数量
+	struct handle_name *name;   // 别名列表
 };
 
 static struct handle_storage *H = NULL;
@@ -46,6 +47,7 @@ skynet_handle_register(struct skynet_context *ctx) {
 				// 0 is reserved
 				handle = 1;
 			}
+			// 相当于 hash = handle % slot_size，因为 slot_size 是 2^n，所以用按位与替代取模
 			int hash = handle & (s->slot_size-1);
 			if (s->slot[hash] == NULL) {
 				s->slot[hash] = ctx;
