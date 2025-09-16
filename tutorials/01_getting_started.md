@@ -131,17 +131,29 @@ cpath = root.."cservice/?.so" -- C service module path
 
 Let's create a simple "hello world" service.
 
+### 重要提醒：skynet.manager 模块
+
+在使用 `skynet.register()` 函数之前，必须先引入 `skynet.manager` 模块：
+
+```lua
+local skynet = require "skynet"
+require "skynet.manager"  -- 导入 skynet.register 函数
+```
+
+这是因为 `skynet.register()` 函数定义在 `skynet.manager` 模块中，而不是在核心的 `skynet` 模块中。
+
 ### 5.1 Create the Service File
 
 Create `examples/hello_service.lua`:
 
 ```lua
 local skynet = require "skynet"
+require "skynet.manager"  -- 导入 skynet.register 函数
 
 skynet.start(function()
     print("Hello Service started!")
     
-    -- Register a command handler
+    -- 注册命令处理器
     skynet.dispatch("lua", function(session, address, cmd, ...)
         if cmd == "hello" then
             local name = ...
@@ -152,8 +164,8 @@ skynet.start(function()
         end
     end)
     
-    -- Exit the service
-    skynet.exit()
+    -- 注意：不要调用 skynet.exit()，这样服务会持续运行处理消息
+    -- 服务会一直运行直到被显式关闭
 end)
 ```
 
@@ -163,21 +175,26 @@ Edit `examples/main.lua`:
 
 ```lua
 local skynet = require "skynet"
+require "skynet.manager"  -- 导入 skynet.register 函数
 
 skynet.start(function()
     skynet.error("Server start")
     
-    -- Start our hello service
+    -- 启动我们的 hello 服务
     local hello_service = skynet.newservice("hello_service")
     
-    -- Test our service
+    -- 测试我们的服务
     local response = skynet.call(hello_service, "lua", "hello", "Skynet Developer")
     skynet.error("Response:", response)
     
-    -- Start other services
+    -- 启动其他服务
     skynet.newservice("debug_console", 8000)
     
-    skynet.exit()
+    -- 注册服务名称以便其他服务可以调用
+    skynet.register("hello_service")
+    
+    -- 注意：主服务通常不会立即退出
+    -- skynet.exit()  -- 注释掉这行
 end)
 ```
 
@@ -187,11 +204,16 @@ end)
 ./skynet examples/config
 ```
 
-You should see:
+你应该看到：
 ```
 Hello Service started!
-Response: Hello, Skynet Developer!
+[:00000008] Server start
+[:00000008] Response: Hello, Skynet Developer!
+[:0000000a] LAUNCH snlua console
+[:0000000b] LAUNCH snlua debug_console 8000
 ```
+
+注意：服务现在会持续运行，不会立即退出。
 
 ## 6. Exercise: Create a Counter Service
 
@@ -201,7 +223,7 @@ Create a new service that maintains a counter and supports:
 - `get`: Return current counter value
 - `reset`: Reset counter to 0
 
-**Solution**:
+**解决方案**：
 ```lua
 -- examples/counter_service.lua
 local skynet = require "skynet"
@@ -209,6 +231,7 @@ local skynet = require "skynet"
 local counter = 0
 
 skynet.start(function()
+    -- 注册命令处理器
     skynet.dispatch("lua", function(session, address, cmd, ...)
         if cmd == "increment" then
             counter = counter + 1
@@ -227,8 +250,71 @@ skynet.start(function()
         end
     end)
     
-    skynet.exit()
+    -- 注册服务名称
+    skynet.register("COUNTER_SERVICE")
+    
+    -- 服务持续运行，不要退出
+    print("Counter service started and registered as COUNTER_SERVICE")
 end)
+```
+
+### 6.1 如何使用计数器服务
+
+要测试计数器服务，你可以：
+
+1. **修改 main.lua 来测试计数器服务**：
+
+```lua
+-- 在 examples/main.lua 中添加
+local skynet = require "skynet"
+
+skynet.start(function()
+    skynet.error("Server start")
+    
+    -- 启动计数器服务
+    local counter_service = skynet.newservice("counter_service")
+    
+    -- 测试计数器服务
+    skynet.error("Testing counter service...")
+    
+    -- 增加计数器
+    skynet.call(counter_service, "lua", "increment")
+    skynet.call(counter_service, "lua", "increment")
+    
+    -- 获取当前值
+    local value = skynet.call(counter_service, "lua", "get")
+    skynet.error("Counter value after increment:", value)  -- 应该显示 2
+    
+    -- 减少计数器
+    skynet.call(counter_service, "lua", "decrement")
+    value = skynet.call(counter_service, "lua", "get")
+    skynet.error("Counter value after decrement:", value)  -- 应该显示 1
+    
+    -- 重置计数器
+    skynet.call(counter_service, "lua", "reset")
+    value = skynet.call(counter_service, "lua", "get")
+    skynet.error("Counter value after reset:", value)  -- 应该显示 0
+    
+    -- 启动调试控制台
+    skynet.newservice("debug_console", 8000)
+end)
+```
+
+2. **使用调试控制台测试**：
+
+启动 Skynet 后，使用 telnet 连接到调试控制台（端口 8000）：
+
+```bash
+telnet 127.0.0.1 8000
+```
+
+然后在调试控制台中输入：
+```
+call :0100000a "get"
+call :0100000a "increment"
+call :0100000a "get"
+call :0100000a "reset"
+call :0100000a "get"
 ```
 
 ## 7. Troubleshooting Tips
@@ -250,6 +336,11 @@ end)
 4. **Service Not Found**
    - Check `package.path` includes your service directory
    - Verify file permissions
+
+5. **attempt to call a nil value (field 'register')**
+   - This error occurs when trying to use `skynet.register()` without importing the manager module
+   - Fix: Add `require "skynet.manager"` at the top of your service file
+   - The `skynet.register()` function is defined in the manager module, not the core skynet module
 
 ### Debug Commands
 

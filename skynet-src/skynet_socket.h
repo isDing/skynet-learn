@@ -15,10 +15,10 @@ struct skynet_context;
 #define SKYNET_SOCKET_TYPE_WARNING 7
 
 struct skynet_socket_message {
-	int type;
-	int id;
-	int ud;
-	char * buffer;
+	int type;        // 消息类型（数据/连接/关闭等）
+	int id;          // socket ID
+	int ud;          // 用户数据
+	char * buffer;   // 数据缓冲区
 };
 
 void skynet_socket_init();

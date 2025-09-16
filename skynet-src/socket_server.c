@@ -62,11 +62,11 @@
 #define USEROBJECT ((size_t)(-1))
 
 struct write_buffer {
-	struct write_buffer * next;
-	const void *buffer;
-	char *ptr;
-	size_t sz;
-	bool userobject;
+	struct write_buffer * next;    // 链表指针
+	const void *buffer;           // 数据缓冲区指针
+	char *ptr;                    // 当前写位置
+	size_t sz;                    // 剩余大小
+	bool userobject;              // 是否为用户对象
 };
 
 struct write_buffer_udp {
@@ -86,48 +86,50 @@ struct socket_stat {
 	uint64_t write;
 };
 
+// 单个socket的完整状态
 struct socket {
-	uintptr_t opaque;
-	struct wb_list high;
-	struct wb_list low;
-	int64_t wb_size;
-	struct socket_stat stat;
-	ATOM_ULONG sending;
-	int fd;
-	int id;
-	ATOM_INT type;
-	uint8_t protocol;
-	bool reading;
-	bool writing;
-	bool closing;
-	ATOM_INT udpconnecting;
-	int64_t warn_size;
+	uintptr_t opaque;              // 拥有此socket的服务句柄
+	struct wb_list high;           // 高优先级写缓冲区链表
+	struct wb_list low;            // 低优先级写缓冲区链表
+	int64_t wb_size;               // 写缓冲区总大小
+	struct socket_stat stat;       // 统计信息(读写字节数和时间)
+	ATOM_ULONG sending;            // 原子变量：正在发送的引用计数
+	int fd;                        // 系统文件描述符
+	int id;                        // skynet内部socket ID
+	ATOM_INT type;                 // 原子变量：socket状态类型
+	uint8_t protocol;              // 协议类型(TCP/UDP/UDPv6)
+	bool reading;                  // 是否启用读事件
+	bool writing;                  // 是否启用写事件
+	bool closing;                  // 是否正在关闭
+	ATOM_INT udpconnecting;        // UDP连接计数
+	int64_t warn_size;             // 警告阈值大小
 	union {
-		int size;
-		uint8_t udp_address[UDP_ADDRESS_SIZE];
+		int size;                  // TCP读缓冲区大小
+		uint8_t udp_address[UDP_ADDRESS_SIZE]; // UDP地址
 	} p;
-	struct spinlock dw_lock;
-	int dw_offset;
-	const void * dw_buffer;
-	size_t dw_size;
+	struct spinlock dw_lock;       // 直写锁
+	int dw_offset;                 // 直写偏移量
+	const void * dw_buffer;        // 直写缓冲区
+	size_t dw_size;                // 直写大小
 };
 
+// 整个socket服务器状态
 struct socket_server {
-	volatile uint64_t time;
-	int reserve_fd;	// for EMFILE
-	int recvctrl_fd;
-	int sendctrl_fd;
-	int checkctrl;
-	poll_fd event_fd;
-	ATOM_INT alloc_id;
-	int event_n;
-	int event_index;
-	struct socket_object_interface soi;
-	struct event ev[MAX_EVENT];
-	struct socket slot[MAX_SOCKET];
-	char buffer[MAX_INFO];
-	uint8_t udpbuffer[MAX_UDP_PACKAGE];
-	fd_set rfds;
+	volatile uint64_t time;        // 当前时间戳
+	int reserve_fd;	// for EMFILE   // 预留fd，用于EMFILE错误处理
+	int recvctrl_fd;               // 控制管道读端
+	int sendctrl_fd;               // 控制管道写端
+	int checkctrl;                 // 是否检查控制命令
+	poll_fd event_fd;              // epoll/kqueue文件描述符
+	ATOM_INT alloc_id;             // 原子变量：ID分配器
+	int event_n;                   // 事件数量
+	int event_index;               // 当前事件索引
+	struct socket_object_interface soi; // 对象接口回调
+	struct event ev[MAX_EVENT];    // 事件数组
+	struct socket slot[MAX_SOCKET]; // socket池 (65536个槽位)
+	char buffer[MAX_INFO];         // 信息缓冲区
+	uint8_t udpbuffer[MAX_UDP_PACKAGE]; // UDP数据包缓冲区
+	fd_set rfds;                   // select用的文件描述符集合
 };
 
 struct request_open {

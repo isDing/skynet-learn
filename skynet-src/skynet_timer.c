@@ -22,13 +22,13 @@ typedef void (*timer_execute_func)(void *ud,void *arg);
 #define TIME_LEVEL_MASK (TIME_LEVEL-1)
 
 struct timer_event {
-	uint32_t handle;
-	int session;
+	uint32_t handle;    // 目标服务句柄
+	int session;        // 会话ID
 };
 
 struct timer_node {
-	struct timer_node *next;
-	uint32_t expire;
+	struct timer_node *next;  // 下一个节点
+	uint32_t expire;         // 过期时间
 };
 
 struct link_list {
@@ -37,13 +37,13 @@ struct link_list {
 };
 
 struct timer {
-	struct link_list near[TIME_NEAR];
-	struct link_list t[4][TIME_LEVEL];
-	struct spinlock lock;
-	uint32_t time;
-	uint32_t starttime;
-	uint64_t current;
-	uint64_t current_point;
+	struct link_list near[TIME_NEAR];       // 近期时间轮（256个槽位），处理最近256个时间单位的定时器
+	struct link_list t[4][TIME_LEVEL];      // 4层分层时间轮（每层64个槽位）
+	struct spinlock lock;                   // 自旋锁
+	uint32_t time;                          // 当前时间（百分之一秒）
+	uint32_t starttime;                     // 启动时间（秒）
+	uint64_t current;                       // 当前累计时间
+	uint64_t current_point;                 // 当前时间点
 };
 
 static struct timer * TI = NULL;

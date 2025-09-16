@@ -1,29 +1,29 @@
-# Network Programming with Skynet
+# Network Programming with Skynet（Skynet 网络编程）
 
-## What You'll Learn
-- Skynet's socket API and network programming model
-- Building TCP servers with gate service
-- Client connection management
-- Protocol handling and message framing
-- WebSocket and HTTP support
-- Network security and optimization
+## What You'll Learn（你将学到的内容）
+- Skynet's socket API and network programming model（Skynet 的 Socket API 与网络编程模型）
+- Building TCP servers with gate service（使用 Gate 服务构建 TCP 服务器）
+- Client connection management（客户端连接管理）
+- Protocol handling and message framing（协议处理与消息封帧）
+- WebSocket and HTTP support（WebSocket 与 HTTP 支持）
+- Network security and optimization（网络安全与优化）
 
-## Prerequisites
-- Completed Tutorial 5: Working with Lua Services
-- Understanding of basic network programming concepts
-- Knowledge of TCP/IP protocols
+## Prerequisites（前置要求）
+- Completed Tutorial 5: Working with Lua Services（已完成教程 5：Lua 服务开发实践）
+- Understanding of basic network programming concepts（理解基础网络编程概念）
+- Knowledge of TCP/IP protocols（掌握 TCP/IP 协议相关知识）
 
-## Time Estimate
-60 minutes
+## Time Estimate（预计耗时）
+60 minutes（60 分钟）
 
-## Final Result
-Ability to build scalable network services using Skynet's networking capabilities
+## Final Result（学习成果）
+Ability to build scalable network services using Skynet's networking capabilities（能够使用 Skynet 的网络功能构建可扩展的网络服务）
 
 ---
 
-## 1. Skynet Network Architecture
+## 1. Skynet Network Architecture（1. Skynet 网络架构）
 
-### 1.1 Network Stack Overview
+### 1.1 Network Stack Overview（1.1 网络栈概述）
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -50,41 +50,41 @@ Ability to build scalable network services using Skynet's networking capabilitie
 └─────────────────────────────────────────────────┘
 ```
 
-### 1.2 Key Components
+### 1.2 Key Components（1.2 核心组件）
 
-- **Socket Driver**: Low-level socket operations
-- **Gate Service**: Connection management and message routing
-- **Agent Services**: Per-client connection handlers
-- **Watchdog Service**: Connection lifecycle management
+- **Socket Driver**: Low-level socket operations（Socket 驱动：负责底层 Socket 操作，如连接建立、数据读写）
+- **Gate Service**: Connection management and message routing（Gate 服务：连接管理与消息路由，统一处理客户端连接）
+- **Agent Services**: Per-client connection handlers（Agent 服务：每个客户端连接的专属处理器，处理业务逻辑）
+- **Watchdog Service**: Connection lifecycle management（Watchdog 服务：连接生命周期管理，协调 Gate 与 Agent 服务）
 
-## 2. Basic Socket Operations
+## 2. Basic Socket Operations（2. 基础 Socket 操作）
 
-### 2.1 Socket API Basics
+### 2.1 Socket API Basics（2.1 Socket API 基础）
 
 ```lua
 local socket = require "skynet.socket"
 
--- Create TCP server
+-- Create TCP server（创建 TCP 服务器）
 local fd = socket.listen("0.0.0.0", 8888)
 socket.start(fd, function(fd, addr)
-    -- New connection handler
+    -- New connection handler（新连接处理逻辑）
     skynet.error("New connection from:", addr)
     
-    -- Start reading from socket
+    -- Start reading from socket（循环读取客户端数据）
     while true do
         local data = socket.read(fd)
         if not data then
             break
         end
         
-        -- Echo back
+        -- Echo back（回声服务：将接收到的数据原样返回给客户端）
         socket.write(fd, data)
     end
     
     socket.close(fd)
 end)
 
--- TCP client connection
+-- TCP client connection（创建 TCP 客户端）
 local fd = socket.connect("127.0.0.1", 8888)
 if fd then
     socket.write(fd, "Hello, Server!\n")
@@ -94,14 +94,14 @@ if fd then
 end
 ```
 
-### 2.2 Non-blocking Operations
+### 2.2 Non-blocking Operations（2.2 非阻塞操作）
 
 ```lua
--- Non-blocking read with timeout
+-- Non-blocking read with timeout（带超时的非阻塞读取）
 local function read_with_timeout(fd, timeout)
     local co = coroutine.running()
     
-    -- Set timeout
+    -- Set timeout（设置超时定时器：超时后关闭连接并唤醒协程）
     local timer = skynet.timeout(timeout * 100, function()
         if coroutine.status(co) ~= "dead" then
             socket.close(fd)
@@ -109,14 +109,14 @@ local function read_with_timeout(fd, timeout)
         end
     end)
     
-    -- Read data
+    -- Read data（读取数据：Socket.read 为非阻塞操作，会挂起协程）
     local data = socket.read(fd)
     skynet.kill(timer)
     
     return data
 end
 
--- Async write
+-- Async write（异步写入：捕获写入错误，避免阻塞）
 local function async_write(fd, data)
     local ok, err = pcall(socket.write, fd, data)
     if not ok then
@@ -127,12 +127,12 @@ local function async_write(fd, data)
 end
 ```
 
-## 3. Building a TCP Server with Gate
+## 3. Building a TCP Server with Gate（3. 使用 Gate 服务构建 TCP 服务器）
 
-### 3.1 Gate Service Configuration
+### 3.1 Gate Service Configuration（3.1 Gate 服务配置）
 
 ```lua
--- mygate.lua
+-- mygate.lua（Gate 服务实现文件）
 local skynet = require "skynet"
 local gateserver = require "snax.gateserver"
 
@@ -152,7 +152,7 @@ function handlers.connect(fd, addr)
         connected = true
     }
     
-    -- Notify watchdog
+    -- Notify watchdog（通知 Watchdog 服务有新连接）
     skynet.send(conf.watchdog, "lua", "connect", fd, addr)
 end
 
@@ -160,7 +160,7 @@ function handlers.disconnect(fd)
     skynet.error("Client disconnected:", fd)
     connections[fd] = nil
     
-    -- Notify watchdog
+    -- Notify watchdog（通知 Watchdog 服务连接已断开）
     skynet.send(conf.watchdog, "lua", "disconnect", fd)
 end
 
@@ -170,12 +170,12 @@ function handlers.error(fd, msg)
 end
 
 function handlers.message(fd, msg, sz)
-    -- Forward message to agent
+    -- Forward message to agent（将消息转发给对应 Agent 服务）
     local conn = connections[fd]
     if conn and conn.agent then
         skynet.redirect(conn.agent, conn.client, "client", fd, msg, sz)
     else
-        -- No agent, notify watchdog
+        -- No agent, notify watchdog（未分配 Agent 时，通知 Watchdog 处理）
         skynet.send(conf.watchdog, "lua", "message", fd, msg, sz)
     end
 end
@@ -204,7 +204,7 @@ handlers.command = command_handler
 gateserver.start(handlers)
 ```
 
-### 3.2 Watchdog Service
+### 3.2 Watchdog Service（3.2 Watchdog 服务）
 
 ```lua
 -- mywatchdog.lua
@@ -213,16 +213,16 @@ local skynet = require "skynet"
 local CMD = {}
 local SOCKET = {}
 local gate
-local agents = {}  -- fd -> agent
+local agents = {}  -- 存储 fd 与 Agent 服务的映射关系（fd -> agent）
 
 function SOCKET.connect(fd, addr)
     skynet.error("New client from:", addr)
     
-    -- Create agent for this connection
+    -- Create agent for this connection（为新连接创建专属 Agent 服务）
     local agent = skynet.newservice("myagent")
     agents[fd] = agent
     
-    -- Start agent
+    -- Start agent（初始化 Agent 服务，传递配置信息）
     skynet.call(agent, "lua", "start", {
         gate = gate,
         client = fd,
@@ -241,7 +241,7 @@ function SOCKET.disconnect(fd)
 end
 
 function SOCKET.message(fd, msg, sz)
-    -- Handle messages before agent is ready
+    -- Handle messages before agent is ready（Agent 未就绪时的消息处理）
     skynet.error("Message before agent ready:", fd)
 end
 
@@ -276,7 +276,7 @@ skynet.start(function()
 end)
 ```
 
-### 3.3 Agent Service
+### 3.3 Agent Service（3.3 Agent 服务）
 
 ```lua
 -- myagent.lua
@@ -291,20 +291,21 @@ local client_addr
 local CMD = {}
 local REQUEST = {}
 
--- Protocol handlers
+-- Protocol handlers（业务请求处理器：登录请求）
 function REQUEST:login(data)
     local username = data.username
     local password = data.password
     
-    -- Validate login
+    -- Validate login（验证登录信息）
     if username == "admin" and password == "secret" then
-        -- Send success response
+        -- Send success response（发送登录成功响应）
         send_response({
             status = "ok",
             message = "Login successful"
         })
         return true
     else
+        -- Send failure response（发送登录失败响应）
         send_response({
             status = "error",
             message = "Invalid credentials"
@@ -324,7 +325,7 @@ function REQUEST:quit()
     skynet.call(watchdog, "lua", "close", client_fd)
 end
 
--- Helper functions
+-- Helper functions（辅助函数：发送响应给客户端）
 local function send_response(response)
     local pack = skynet.pack(response)
     local package = string.pack(">s2", pack)
@@ -351,7 +352,7 @@ local function read_message()
     return skynet.unpack(msg)
 end
 
--- Main loop
+-- Main loop（主循环：持续读取并处理客户端消息）
 local function client_loop()
     while true do
         local request = read_message()
@@ -386,7 +387,7 @@ function CMD.start(conf)
     watchdog = conf.watchdog
     client_addr = conf.addr
     
-    -- Register client protocol
+    -- 注册 "client" 协议：用于接收 Gate 转发的客户端消息
     skynet.register_protocol {
         name = "client",
         id = skynet.PTYPE_CLIENT,
@@ -394,17 +395,17 @@ function CMD.start(conf)
             return skynet.unpack(msg, sz)
         end,
         dispatch = function()
-            -- Handled in client_loop
+            -- 消息处理逻辑在 client_loop 中实现，此处留空
         end
     }
     
-    -- Forward messages to this agent
+    -- 通知 Gate 服务：将当前客户端的消息转发给本 Agent
     skynet.call(gate, "lua", "forward", client_fd, skynet.self())
     
-    -- Start client loop in background
+    -- 启动客户端消息处理循环（在新协程中执行，避免阻塞）
     skynet.fork(client_loop)
     
-    -- Send welcome message
+    -- 发送欢迎消息给客户端
     send_response({
         status = "ok",
         message = "Welcome to server"
@@ -427,22 +428,22 @@ skynet.start(function()
 end)
 ```
 
-## 4. Protocol Handling
+## 4. Protocol Handling（4. 协议处理）
 
-### 4.1 Message Framing
+### 4.1 Message Framing（4.1 消息封帧）
 
 ```lua
--- Protocol utilities
+-- Protocol utilities（协议工具模块：实现消息的封帧与解帧）
 local protocol = {}
 
--- Pack message with length prefix
+-- Pack message with length prefix（消息封帧：添加 4 字节大端序长度前缀）
 function protocol.pack_message(msg)
     local data = skynet.pack(msg)
     local len = #data
     return string.pack(">I4", len) .. data
 end
 
--- Unpack message with length prefix
+-- Unpack message with length prefix（消息解帧：解析带长度前缀的消息流）
 function protocol.unpack_message(data)
     local pos = 1
     local messages = {}
@@ -469,7 +470,7 @@ function protocol.unpack_message(data)
     return messages, data:sub(pos)
 end
 
--- Stream reader
+-- Stream reader（流读取器：处理 Socket 流数据，持续解析消息）
 local function stream_reader(fd)
     local buffer = ""
     
@@ -492,10 +493,10 @@ local function stream_reader(fd)
 end
 ```
 
-### 4.2 JSON Protocol Example
+### 4.2 JSON Protocol Example（4.2 JSON 协议示例）
 
 ```lua
--- JSON protocol handler
+-- JSON protocol handler（JSON 协议处理器：基于 JSON 格式的消息编码/解码）
 local json = require "cjson"
 
 local json_protocol = {}
@@ -513,7 +514,7 @@ function json_protocol.decode(data)
     return nil
 end
 
--- Usage in agent
+-- Usage in agent（在 Agent 服务中使用 JSON 协议处理消息）
 local function handle_json_message(fd)
     local reader = stream_reader(fd)
     
@@ -525,7 +526,7 @@ local function handle_json_message(fd)
         
         local request = json_protocol.decode(msg)
         if request then
-            -- Process request
+            -- 处理请求（需实现 process_request 函数）
             local response = process_request(request)
             local response_data = json_protocol.encode(response)
             socket.write(fd, response_data)
@@ -534,9 +535,9 @@ local function handle_json_message(fd)
 end
 ```
 
-## 5. WebSocket Support
+## 5. WebSocket Support（5. WebSocket 支持）
 
-### 5.1 WebSocket Server
+### 5.1 WebSocket Server（5.1 WebSocket 服务器）
 
 ```lua
 -- websocket_server.lua
@@ -562,12 +563,12 @@ local function handle_connection(id, addr, url, header)
         end
         
         if typ == "text" then
-            -- Handle text message
+            -- Handle text message（处理文本消息：JSON 格式）
             local request = json.decode(data)
             local response = process_websocket_request(request)
             websocket.write(id, json.encode(response))
         elseif typ == "binary" then
-            -- Handle binary message
+            -- Handle binary message（处理二进制消息：如protobuf、自定义二进制格式）
             process_binary_data(id, data)
         elseif typ == "close" then
             break
@@ -591,7 +592,7 @@ local function start_websocket_server(host, port)
     end)
 end
 
--- Broadcast to all connected clients
+-- 广播消息：向所有已连接的 WebSocket 客户端发送消息
 local function broadcast(message)
     local data = json.encode(message)
     for id, conn in pairs(connections) do
@@ -600,7 +601,7 @@ local function broadcast(message)
 end
 ```
 
-### 5.2 WebSocket Client
+### 5.2 WebSocket Client（5.2 WebSocket 客户端）
 
 ```lua
 -- websocket_client.lua
@@ -614,13 +615,13 @@ local function start_client(url)
         return
     end
     
-    -- Send message
+    -- 发送连接消息（JSON 格式）
     websocket.write(id, json.encode({
         type = "hello",
         data = "Client connected"
     }))
     
-    -- Read responses
+    -- 持续读取服务器响应
     while true do
         local data, typ = websocket.read(id)
         if not data then
@@ -637,15 +638,16 @@ local function start_client(url)
 end
 ```
 
-## 6. HTTP Server
+## 6. HTTP Server（6. HTTP 服务器）
 
-### 6.1 Simple HTTP Server
+### 6.1 Simple HTTP Server（6.1 简单 HTTP 服务器）
 
 ```lua
 -- http_server.lua
 local skynet = require "skynet"
 local httpd = require "http.httpd"
 local sockethelper = require "http.sockethelper"
+local json = require "cjson"
 
 local function handle_request(id, header, method, path, query)
     skynet.error("HTTP request:", method, path)
@@ -669,11 +671,11 @@ local function handle_request(id, header, method, path, query)
         }
         return response
     elseif method == "POST" and path == "/api/data" then
-        -- Read POST data
+        -- Read POST data（读取 POST 数据：根据 Content-Length 头获取数据长度）
         local len = tonumber(header["content-length"]) or 0
         local data = sockethelper.read(id, len)
         
-        -- Process data
+        -- Process data（处理 POST 数据：需实现 process_post_data 函数）
         local result = process_post_data(data)
         
         return {
@@ -705,13 +707,13 @@ local function http_session(id)
         return
     end
     
-    -- Parse path and query
+    -- Parse path and query（解析请求路径和查询参数：拆分 URL 中的路径和 ? 后的查询串）
     local path, query = url:match("^([^?]+)%??(.*)$")
     
-    -- Handle request
+    -- Handle request（处理请求，获取响应）
     local response = handle_request(id, header, method, path, query)
     
-    -- Send response
+    -- Send response（发送 HTTP 响应：写入状态码、响应头、响应体）
     httpd.write_response(sockethelper.writefunc(id), 
                          response.code, 
                          response.body or "", 
@@ -728,12 +730,12 @@ local function start_http_server(host, port)
 end
 ```
 
-## 7. Network Security
+## 7. Network Security（7. 网络安全）
 
-### 7.1 Connection Limiting
+### 7.1 Connection Limiting（7.1 连接限制）
 
 ```lua
--- Connection limiter
+-- Connection limiter（连接限制器：限制单 IP 连接数和总连接数）
 local connection_limiter = {
     max_connections_per_ip = 10,
     ip_connections = {},
@@ -745,13 +747,13 @@ local function check_connection_limit(addr)
     local ip = addr:match("^(%d+%.%d+%.%d+%.%d+)")
     if not ip then return true end
     
-    -- Check per-IP limit
+    -- Check per-IP limit（检查单 IP 连接数限制）
     connection_limiter.ip_connections[ip] = connection_limiter.ip_connections[ip] or 0
     if connection_limiter.ip_connections[ip] >= connection_limiter.max_connections_per_ip then
         return false, "Too many connections from your IP"
     end
     
-    -- Check total limit
+    -- Check total limit（检查总连接数限制）
     if connection_limiter.total_connections >= connection_limiter.max_total_connections then
         return false, "Server full"
     end
@@ -779,10 +781,10 @@ local function remove_connection(addr, fd)
 end
 ```
 
-### 7.2 Rate Limiting
+### 7.2 Rate Limiting（7.2 速率限制）
 
 ```lua
--- Rate limiter using token bucket
+-- Rate limiter using token bucket（基于令牌桶算法的速率限制器）
 local rate_limiter = {
     buckets = {}
 }
@@ -799,7 +801,7 @@ local function get_token_bucket(key, rate, capacity)
         rate_limiter.buckets[key] = bucket
     end
     
-    -- Update tokens
+    -- Update tokens（更新令牌数量：根据时间差和速率生成新令牌）
     local now = skynet.time()
     local elapsed = now - bucket.last_update
     bucket.tokens = math.min(bucket.capacity, 
@@ -820,18 +822,18 @@ local function check_rate_limit(key, rate, capacity, cost)
     return false
 end
 
--- Usage
+-- Usage（使用示例：限制客户端 IP 的请求速率）
 local function handle_request(client_ip)
     if not check_rate_limit(client_ip, 10, 100, 1) then
         return false, "Rate limit exceeded"
     end
     
-    -- Process request
+    -- Process request（处理请求）
     return true
 end
 ```
 
-## 8. Example: Chat Server Implementation
+## 8. Example: Chat Server Implementation（8. 示例：聊天室服务器实现）
 
 ```lua
 -- chat_server.lua
@@ -843,7 +845,7 @@ local rooms = {}
 local clients = {}
 local message_id = 0
 
--- Gate server handlers
+-- Gate server handlers（Gate 服务事件处理器）
 local handlers = {}
 
 function handlers.connect(fd, addr)
@@ -869,7 +871,7 @@ function handlers.message(fd, msg, sz)
     local client = clients[fd]
     if not client then return end
     
-    -- Parse message (simple protocol: command\nbody)
+    -- 解析消息（简单协议：命令\n消息体）
     local cmd, body = string.match(msg, "^(%w+)\n(.*)$")
     if not cmd then
         cmd = msg
@@ -892,12 +894,12 @@ local function join_room(fd, room_name)
     local client = clients[fd]
     if not client then return end
     
-    -- Leave current room
+    -- Leave current room（若已在其他房间，先离开）
     if client.room then
         leave_room(fd, client.room)
     end
     
-    -- Join new room
+    -- Join new room（加入新房间：若房间不存在则创建）
     if not rooms[room_name] then
         rooms[room_name] = { clients = {} }
     end
@@ -905,14 +907,14 @@ local function join_room(fd, room_name)
     rooms[room_name].clients[fd] = true
     client.room = room_name
     
-    -- Broadcast join message
+    -- Broadcast join message（广播加入消息：通知房间内所有用户）
     broadcast_to_room(room_name, {
         type = "join",
         user = client.name,
         message = client.name .. " joined the room"
     })
     
-    -- Send room info
+    -- Send room info（向新加入用户发送房间信息）
     send_to_client(fd, {
         type = "room_joined",
         room = room_name,
@@ -928,14 +930,14 @@ local function leave_room(fd, room_name)
     if room then
         room.clients[fd] = nil
         
-        -- Broadcast leave message
+        -- Broadcast leave message（广播离开消息：通知房间内所有用户，排除自己）
         broadcast_to_room(room_name, {
             type = "leave",
             user = client.name,
             message = client.name .. " left the room"
         }, fd)
         
-        -- Clean up empty rooms
+        -- Clean up empty rooms（若房间无用户，删除房间以节省内存）
         if next(room.clients) == nil then
             rooms[room_name] = nil
         end
@@ -961,7 +963,7 @@ local function send_message(fd, text)
     broadcast_to_room(client.room, message, fd)
 end
 
--- Utility functions
+-- Utility functions（辅助函数）
 local function broadcast_to_room(room_name, message, exclude_fd)
     local room = rooms[room_name]
     if not room then return end
@@ -1010,37 +1012,37 @@ local function change_nick(fd, new_name)
     end
 end
 
--- Start gate server
+-- Start gate server（启动 Gate 服务，运行聊天室）
 gateserver.start(handlers)
 ```
 
-## 9. Exercise: Real-time Game Server
+## 9. Exercise: Real-time Game Server（9. 练习：实时游戏服务器）
 
-Create a real-time multiplayer game server with:
-1. Player movement synchronization
-2. Game state management
-3. Room/lobby system
-4. Player authentication
-5. Lag compensation techniques
+Create a real-time multiplayer game server with:（创建一个实时多人游戏服务器，需包含以下功能）
+1. Player movement synchronization（玩家移动同步）
+2. Game state management（游戏状态管理）
+3. Room/lobby system（房间/大厅系统）
+4. Player authentication（玩家认证）
+5. Lag compensation techniques（延迟补偿技术）
 
-**Features to implement**:
-- UDP support for fast updates
-- Entity interpolation
-- Client-side prediction
-- Server reconciliation
-- Anti-cheat measures
+**Features to implement**:（需实现的额外特性）
+- UDP support for fast updates（支持 UDP 协议以实现快速更新）
+- Entity interpolation（实体插值：平滑显示远程玩家移动）
+- Client-side prediction（客户端预测：本地预测移动结果，减少延迟感）
+- Server reconciliation（服务器修正：服务器验证并修正客户端预测结果）
+- Anti-cheat measures（反作弊措施：如移动速度限制、位置验证等）
 
-## Summary
+## Summary（总结）
 
-In this tutorial, you learned:
-- Skynet's socket API and network programming model
-- Building scalable TCP servers with gate service
-- Protocol handling and message framing
-- WebSocket and HTTP server implementation
-- Network security practices
-- Connection and rate limiting
-- Building a complete chat server
+In this tutorial, you learned:（在本教程中，你学习了）
+- Skynet's socket API and network programming model（Skynet 的 Socket API 与网络编程模型）
+- Building scalable TCP servers with gate service（使用 Gate 服务构建可扩展的 TCP 服务器）
+- Protocol handling and message framing（协议处理与消息封帧技术）
+- WebSocket and HTTP server implementation（WebSocket 与 HTTP 服务器实现）
+- Network security practices（网络安全实践：连接限制与速率限制）
+- Connection and rate limiting（连接管理与速率控制）
+- Building a complete chat server（完整聊天室服务器的构建）
 
-## Next Steps
+## Next Steps（下一步）
 
-Continue to [Tutorial 7: Distributed Skynet Applications](./tutorial7_distributed.md) to learn about building distributed systems with Skynet's cluster and harbor services.
+Continue to [Tutorial 7: Distributed Skynet Applications](./tutorial7_distributed.md) to learn about building distributed systems with Skynet's cluster and harbor services.（继续学习《教程 7：分布式 Skynet 应用》，了解如何使用 Skynet 的 cluster 和 harbor 服务构建分布式系统。）

@@ -32,7 +32,7 @@ Skynet cluster allows multiple Skynet nodes to work together as a unified system
 │    Node 1       │    │    Node 2       │    │    Node 3       │
 │                 │    │                 │    │                 │
 │ ┌─────────────┐ │    │ ┌─────────────┐ │    │ ┌─────────────┐ │
-│ │   Harbor    │◄┼────┼│   Harbor    │◄┼────┼│   Harbor    │ │
+│ │   Harbor    │◄┼────┼─│   Harbor    │◄┼────┼─│   Harbor    │ │
 │ │   Service   │ │    │ │   Service   │ │    │ │   Service   │ │
 │ └─────────────┘ │    │ └─────────────┘ │    │ └─────────────┘ │
 │ ┌─────────────┐ │    │ ┌─────────────┐ │    │ ┌─────────────┐ │
@@ -47,10 +47,10 @@ Skynet cluster allows multiple Skynet nodes to work together as a unified system
          │                       │                       │
          └───────────────────────┼───────────────────────┘
                                  │
-                    ┌─────────────────┐
-                    │   Master Node   │
-                    │   (Optional)    │
-                    └─────────────────┘
+                        ┌─────────────────┐
+                        │   Master Node   │
+                        │   (Optional)    │
+                        └─────────────────┘
 ```
 
 ### 1.2 Key Components

@@ -24,13 +24,13 @@
 #define MEMORY_WARNING_REPORT (1024 * 1024 * 32)
 
 struct snlua {
-	lua_State * L;
-	struct skynet_context * ctx;
-	size_t mem;
-	size_t mem_report;
-	size_t mem_limit;
-	lua_State * activeL;
-	ATOM_INT trap;
+	lua_State * L;          // 主Lua状态机
+	struct skynet_context * ctx;  // 关联的skynet上下文
+	size_t mem;             // 当前内存使用量
+	size_t mem_report;      // 内存报警阈值
+	size_t mem_limit;       // 内存限制
+	lua_State * activeL;    // 当前活跃的Lua状态机
+	ATOM_INT trap;          // 原子信号标志
 };
 
 // LUA_CACHELIB may defined in patched lua for shared proto
@@ -384,10 +384,10 @@ static int
 init_cb(struct snlua *l, struct skynet_context *ctx, const char * args, size_t sz) {
 	lua_State *L = l->L;
 	l->ctx = ctx;
-	lua_gc(L, LUA_GCSTOP, 0);
+	lua_gc(L, LUA_GCSTOP, 0);  // 暂停GC
 	lua_pushboolean(L, 1);  /* signal for libraries to ignore env. vars. */
 	lua_setfield(L, LUA_REGISTRYINDEX, "LUA_NOENV");
-	luaL_openlibs(L);
+	luaL_openlibs(L);  // 加载标准库
 	luaL_requiref(L, "skynet.profile", init_profile, 0);
 
 	int profile_lib = lua_gettop(L);
