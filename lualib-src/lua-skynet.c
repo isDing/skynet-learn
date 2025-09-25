@@ -245,12 +245,13 @@ get_dest_string(lua_State *L, int index) {
 static int
 send_message(lua_State *L, int source, int idx_type) {
 	struct skynet_context * context = lua_touserdata(L, lua_upvalueindex(1));
-	uint32_t dest = (uint32_t)lua_tointeger(L, 1);
+	uint32_t dest = (uint32_t)lua_tointeger(L, 1);  // 尝试解析为数字
 	const char * dest_string = NULL;
 	if (dest == 0) {
 		if (lua_type(L,1) == LUA_TNUMBER) {
 			return luaL_error(L, "Invalid service address 0");
 		}
+        // 不是数字，是字符串地址如 ".launcher"
 		dest_string = get_dest_string(L, 1);
 	}
 

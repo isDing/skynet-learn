@@ -81,6 +81,7 @@ skynet_socket_poll() {
 	assert(ss);
 	struct socket_message result;
 	int more = 1;
+    // 从底层获取一个网络事件
 	int type = socket_server_poll(ss, &result, &more);
 	switch (type) {
 	case SOCKET_EXIT:

@@ -9,10 +9,10 @@
 #include <string.h>
 
 struct skynet_monitor {
-	ATOM_INT version;
-	int check_version;
-	uint32_t source;
-	uint32_t destination;
+	ATOM_INT version;    // 原子版本号（消息处理计数）
+	int check_version;   // 上次检查的版本号
+	uint32_t source;     // 当前处理消息的来源服务
+	uint32_t destination; // 当前处理消息的目标服务
 };
 
 struct skynet_monitor * 

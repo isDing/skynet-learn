@@ -19,12 +19,12 @@
 #include <signal.h>
 
 struct monitor {
-	int count;
-	struct skynet_monitor ** m;
-	pthread_cond_t cond;
-	pthread_mutex_t mutex;
-	int sleep;
-	int quit;
+	int count;                      // 工作线程数量
+	struct skynet_monitor ** m;     // 每个工作线程的监控器数组
+	pthread_cond_t cond;           // 条件变量（工作线程同步）
+	pthread_mutex_t mutex;         // 互斥锁
+	int sleep;                     // 休眠的工作线程数
+	int quit;                      // 退出标志
 };
 
 struct worker_parm {
@@ -65,14 +65,14 @@ thread_socket(void *p) {
 	struct monitor * m = p;
 	skynet_initthread(THREAD_SOCKET);
 	for (;;) {
-		int r = skynet_socket_poll();
+		int r = skynet_socket_poll();  // 核心：轮询网络事件
 		if (r==0)
 			break;
 		if (r<0) {
 			CHECK_ABORT
 			continue;
 		}
-		wakeup(m,0);
+		wakeup(m,0);  // 有网络事件时唤醒工作线程
 	}
 	return NULL;
 }
