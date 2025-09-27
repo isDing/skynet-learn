@@ -374,6 +374,7 @@ local function co_create(f)
 		co = coroutine_create(function(...)
 			f(...)
 			while true do
+				-- 会话检查和清理
 				local session = session_coroutine_id[co]
 				if session and session ~= 0 then
 					local source = debug.getinfo(f,"S")
@@ -382,12 +383,13 @@ local function co_create(f)
 						skynet.address(session_coroutine_address[co]),
 						source.source, source.linedefined))
 				end
-				-- coroutine exit
+				-- coroutine exit -- 追踪标签清理
 				local tag = session_coroutine_tracetag[co]
 				if tag ~= nil then
 					if tag then c.trace(tag, "end")	end
 					session_coroutine_tracetag[co] = nil
 				end
+				-- 地址信息清理
 				local address = session_coroutine_address[co]
 				if address then
 					session_coroutine_id[co] = nil
@@ -913,7 +915,7 @@ local function raw_dispatch_message(prototype, msg, sz, session, source)
 			suspend(co, coroutine_resume(co, true, msg, sz, session))
 		end
 	else
-		local p = proto[prototype]
+		local p = proto[prototype]    -- 找到与消息类型对应的解析协议
 		if p == nil then
 			if prototype == skynet.PTYPE_TRACE then
 				-- trace next request
@@ -926,9 +928,9 @@ local function raw_dispatch_message(prototype, msg, sz, session, source)
 			return
 		end
 
-		local f = p.dispatch
+		local f = p.dispatch  -- 获取消息处理函数，可以视为该类协议的消息回调函数
 		if f then
-			local co = co_create(f)
+			local co = co_create(f)   -- 如果协程池内有空闲的协程，则直接返回，否则创建一个新的协程，该协程用于执行该类协议的消息处理函数dispatch
 			session_coroutine_id[co] = session
 			session_coroutine_address[co] = source
 			local traceflag = p.trace
@@ -948,7 +950,7 @@ local function raw_dispatch_message(prototype, msg, sz, session, source)
 					skynet.trace()
 				end
 			end
-			suspend(co, coroutine_resume(co, session,source, p.unpack(msg,sz)))
+			suspend(co, coroutine_resume(co, session,source, p.unpack(msg,sz)))  -- 启动并执行协程，将结果返回给suspend
 		else
 			trace_source[source] = nil
 			if session ~= 0 then

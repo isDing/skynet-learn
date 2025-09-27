@@ -362,6 +362,7 @@ reserve_id(struct socket_server *ss) {
 		if (id < 0) {
 			id = ATOM_FAND(&(ss->alloc_id), 0x7fffffff) & 0x7fffffff;
 		}
+		// 使用hash查找空闲槽位
 		struct socket *s = &ss->slot[HASH_ID(id)];
 		int type_invalid = ATOM_LOAD(&s->type);
 		if (type_invalid == SOCKET_TYPE_INVALID) {
@@ -1708,6 +1709,7 @@ clear_closed_event(struct socket_server *ss, struct socket_message * result, int
 int
 socket_server_poll(struct socket_server *ss, struct socket_message * result, int * more) {
 	for (;;) {
+		// 1. 检查控制命令（来自主线程的socket操作请求）
 		if (ss->checkctrl) {
 			if (has_cmd(ss)) {
 				int type = ctrl_cmd(ss, result);
@@ -1720,7 +1722,9 @@ socket_server_poll(struct socket_server *ss, struct socket_message * result, int
 				ss->checkctrl = 0;
 			}
 		}
+		// 2. 检查是否需要等待新事件
 		if (ss->event_index == ss->event_n) {
+			// 调用epoll_wait等待网络事件
 			ss->event_n = sp_wait(ss->event_fd, ss->ev, MAX_EVENT);
 			ss->checkctrl = 1;
 			if (more) {
@@ -1736,6 +1740,7 @@ socket_server_poll(struct socket_server *ss, struct socket_message * result, int
 				continue;
 			}
 		}
+		// 3. 处理当前事件
 		struct event *e = &ss->ev[ss->event_index++];
 		struct socket *s = e->s;
 		if (s == NULL) {
@@ -1744,6 +1749,7 @@ socket_server_poll(struct socket_server *ss, struct socket_message * result, int
 		}
 		struct socket_lock l;
 		socket_lock_init(s, &l);
+		// 4. 根据socket状态处理
 		switch (ATOM_LOAD(&s->type)) {
 		case SOCKET_TYPE_CONNECTING:
 			return report_connect(ss, s, &l, result);
@@ -1761,6 +1767,7 @@ socket_server_poll(struct socket_server *ss, struct socket_message * result, int
 			skynet_error(NULL, "socket-server error: invalid socket");
 			break;
 		default:
+			// 处理读事件
 			if (e->read) {
 				int type;
 				if (s->protocol == PROTOCOL_TCP) {
@@ -1786,6 +1793,7 @@ socket_server_poll(struct socket_server *ss, struct socket_message * result, int
 					break;
 				return type;
 			}
+			// 处理写事件
 			if (e->write) {
 				int type = send_buffer(ss, s, &l, result);
 				if (type == -1)

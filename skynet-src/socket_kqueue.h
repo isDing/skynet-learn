@@ -15,6 +15,7 @@ sp_invalid(int kfd) {
 	return kfd == -1;
 }
 
+// socket_kqueue.h 主要差异
 static int
 sp_create() {
 	return kqueue();

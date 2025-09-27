@@ -1,0 +1,78 @@
+stateDiagram-v2
+    [*] --> INVALID : socket创建
+    
+    INVALID --> RESERVE : reserve_id()
+    RESERVE --> PLISTEN : listen请求
+    RESERVE --> CONNECTING : connect请求
+    RESERVE --> BIND : bind请求
+    
+    PLISTEN --> LISTEN : 开始监听
+    LISTEN --> PACCEPT : 有连接到达
+    PACCEPT --> CONNECTED : accept完成
+    
+    CONNECTING --> CONNECTED : 连接建立
+    CONNECTING --> INVALID : 连接失败
+    
+    BIND --> CONNECTED : UDP绑定完成
+    
+    CONNECTED --> HALFCLOSE_READ : 对方关闭写端
+    CONNECTED --> HALFCLOSE_WRITE : 本地关闭写端
+    CONNECTED --> INVALID : 连接断开
+    
+    HALFCLOSE_READ --> INVALID : 完全关闭
+    HALFCLOSE_WRITE --> HALFCLOSE_READ : 对方也关闭
+    HALFCLOSE_WRITE --> INVALID : 完全关闭
+    
+    LISTEN --> INVALID : 停止监听
+    INVALID --> [*] : socket释放
+
+    %% 注释说明
+    note right of INVALID
+        初始状态
+        socket未分配
+    end note
+    
+    note right of RESERVE
+        预留状态
+        已分配ID但未使用
+    end note
+    
+    note right of PLISTEN
+        准备监听状态
+        bind完成，准备accept
+    end note
+    
+    note right of LISTEN
+        监听状态
+        等待客户端连接
+    end note
+    
+    note right of CONNECTING
+        连接中状态
+        客户端正在连接服务器
+    end note
+    
+    note right of CONNECTED
+        已连接状态
+        可以正常收发数据
+    end note
+    
+    note right of PACCEPT
+        准备接受状态
+        有新连接待处理
+    end note
+    
+    note right of HALFCLOSE_READ
+        半关闭读状态
+        只能发送，不能接收
+    end note
+    
+    note right of HALFCLOSE_WRITE
+        半关闭写状态
+        只能接收，不能发送
+    end note
+    
+    note right of BIND
+        绑定状态
+        UDP socket绑定端口
+    end note

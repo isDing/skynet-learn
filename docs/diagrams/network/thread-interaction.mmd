@@ -1,0 +1,74 @@
+sequenceDiagram
+    participant NT as 网络线程\n(thread_socket)
+    participant CP as 控制管道\n(ctrl pipe)
+    participant MQ as 全局消息队列\n(global_mq)
+    participant WT1 as 工作线程1\n(thread_worker)
+    participant WT2 as 工作线程2\n(thread_worker)
+    participant WTN as 工作线程N\n(thread_worker)
+    participant SVC as 目标服务\n(service)
+
+    Note over NT: 网络线程主循环
+    
+    %% 网络事件处理
+    NT->>NT: epoll_wait()\n等待网络事件
+    NT->>NT: socket_server_poll()\n处理网络事件
+    
+    %% 数据接收流程
+    NT->>MQ: skynet_mq_push()\n推送接收消息到全局队列
+    
+    %% 工作线程竞争获取消息
+    par 工作线程并发处理
+        WT1->>MQ: skynet_globalmq_pop()\n获取消息
+        and
+        WT2->>MQ: skynet_globalmq_pop()\n尝试获取消息
+        and
+        WTN->>MQ: skynet_globalmq_pop()\n尝试获取消息
+    end
+    
+    %% 假设WT1获取到消息
+    MQ-->>WT1: 返回消息
+    WT1->>SVC: dispatch_message()\n分发消息到服务
+    SVC->>SVC: 处理业务逻辑
+    
+    %% 服务发送数据
+    SVC->>WT1: socket.write()\n发送数据请求
+    WT1->>CP: send_request()\n发送控制命令
+    
+    %% 控制管道通信
+    CP-->>NT: 控制命令传递
+    NT->>NT: ctrl_cmd()\n处理控制命令
+    NT->>NT: 设置socket可写监听
+    
+    %% 写事件处理
+    NT->>NT: epoll_wait()\n等待EPOLLOUT事件
+    NT->>NT: send_buffer()\n发送缓冲区数据
+    
+    %% 连接状态变化通知
+    alt 连接关闭
+        NT->>MQ: 推送关闭消息
+        MQ-->>WT2: 工作线程2处理
+        WT2->>SVC: 通知服务连接关闭
+    else 新连接到达
+        NT->>MQ: 推送接受消息
+        MQ-->>WTN: 工作线程N处理
+        WTN->>SVC: 通知服务新连接
+    end
+    
+    %% 同步机制说明
+    Note over NT: 控制管道实现线程间通信
+    Note over CP: 控制管道实现线程间通信
+    Note over MQ: 全局消息队列使用自旋锁保护
+    Note over WT1: 工作线程池并发处理消息
+    Note over WT2: 工作线程池并发处理消息
+    Note over WTN: 工作线程池并发处理消息
+    
+    %% 性能优化机制
+    rect rgb(240, 248, 255)
+        Note over NT: 网络线程优化:\n1. 批量处理事件\n2. 零拷贝发送\n3. 写缓冲区合并
+    end
+    
+    rect rgb(248, 255, 240)
+        Note over WT1: 工作线程优化:\n1. 无锁消息队列\n2. 协程调度\n3. 服务隔离
+        Note over WT2: 工作线程优化:\n1. 无锁消息队列\n2. 协程调度\n3. 服务隔离
+        Note over WTN: 工作线程优化:\n1. 无锁消息队列\n2. 协程调度\n3. 服务隔离
+    end

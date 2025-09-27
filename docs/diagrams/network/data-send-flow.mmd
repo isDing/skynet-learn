@@ -1,0 +1,68 @@
+graph TD
+    Start([服务发送数据]) --> SocketWrite[socket.write<br/>lua调用]
+    
+    SocketWrite --> SkynetSend[skynet_socket_send<br/>C接口调用]
+    
+    SkynetSend --> CheckBuffer{检查缓冲区}
+    CheckBuffer -->|空闲| DirectSend[send_socket<br/>直接发送]
+    CheckBuffer -->|有数据| AddBuffer[append_sendbuffer<br/>加入写缓冲区]
+    
+    DirectSend --> SendResult{发送结果?}
+    SendResult -->|全部发送| SendComplete[发送完成]
+    SendResult -->|部分发送| AddRemain[剩余数据<br/>加入缓冲区]
+    SendResult -->|EAGAIN| AddAllBuffer[全部数据<br/>加入缓冲区]
+    
+    AddBuffer --> SendCtrl[send_request<br/>发送控制命令]
+    AddRemain --> SendCtrl
+    AddAllBuffer --> SendCtrl
+    
+    SendCtrl --> CtrlPipe[写入控制管道<br/>sendctrl_fd]
+    
+    CtrlPipe --> NetworkThread[网络线程<br/>thread_socket]
+    
+    NetworkThread --> CtrlCmd[ctrl_cmd处理<br/>CMD_REQUEST]
+    
+    CtrlCmd --> SetWritable[sp_write<br/>监听EPOLLOUT]
+    
+    SetWritable --> EpollOut[epoll_wait<br/>等待可写事件]
+    
+    EpollOut --> SendBuffer[send_buffer<br/>发送缓冲区数据]
+    
+    SendBuffer --> SendLoop{发送循环}
+    SendLoop -->|高优先级| SendHigh[发送high队列<br/>控制消息优先]
+    SendLoop -->|低优先级| SendLow[发送low队列<br/>普通数据]
+    
+    SendHigh --> CheckHighResult{发送结果?}
+    SendLow --> CheckLowResult{发送结果?}
+    
+    CheckHighResult -->|完成| NextHigh[下一个high buffer]
+    CheckHighResult -->|EAGAIN| WaitNext[等待下次EPOLLOUT]
+    CheckLowResult -->|完成| NextLow[下一个low buffer]
+    CheckLowResult -->|EAGAIN| WaitNext
+    
+    NextHigh --> SendLoop
+    NextLow --> SendLoop
+    WaitNext --> EpollOut
+    
+    SendComplete --> End([发送完成])
+    
+    %% 错误处理
+    SendResult -->|错误| SendError[发送错误<br/>关闭连接]
+    CheckHighResult -->|错误| SendError
+    CheckLowResult -->|错误| SendError
+    SendError --> End
+    
+    %% 样式定义
+    classDef startEnd fill:#ffcdd2,stroke:#d32f2f,stroke-width:2px
+    classDef luaLayer fill:#e3f2fd,stroke:#0277bd,stroke-width:2px
+    classDef skynetLayer fill:#e1bee7,stroke:#7b1fa2,stroke-width:2px
+    classDef socketLayer fill:#c8e6c9,stroke:#388e3c,stroke-width:2px
+    classDef decision fill:#fff3e0,stroke:#f57c00,stroke-width:2px
+    classDef error fill:#ffebee,stroke:#c62828,stroke-width:2px
+    
+    class Start,End startEnd
+    class SocketWrite luaLayer
+    class SkynetSend,SendCtrl,CtrlPipe skynetLayer
+    class DirectSend,AddBuffer,AddRemain,AddAllBuffer,NetworkThread,CtrlCmd,SetWritable,EpollOut,SendBuffer,SendHigh,SendLow,NextHigh,NextLow,WaitNext socketLayer
+    class CheckBuffer,SendResult,CheckHighResult,CheckLowResult,SendLoop decision
+    class SendError error

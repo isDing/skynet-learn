@@ -1,0 +1,51 @@
+graph TD
+    Start([网络数据到达]) --> EpollWait[epoll_wait返回<br/>EPOLLIN事件]
+    
+    EpollWait --> SocketPoll[socket_server_poll<br/>处理网络事件]
+    
+    SocketPoll --> CheckType{检查事件类型}
+    
+    CheckType -->|SOCKET_DATA| ForwardTCP[forward_message_tcp<br/>读取TCP数据]
+    CheckType -->|SOCKET_UDP| ForwardUDP[forward_message_udp<br/>读取UDP数据]
+    CheckType -->|SOCKET_ACCEPT| ForwardAccept[forward_message_accept<br/>处理新连接]
+    CheckType -->|SOCKET_CLOSE| ForwardClose[forward_message_close<br/>处理连接关闭]
+    
+    ForwardTCP --> ReadSocket[read_socket<br/>从内核缓冲区读取]
+    ForwardUDP --> RecvFrom[recvfrom<br/>读取UDP包]
+    
+    ReadSocket --> CheckRead{读取结果?}
+    CheckRead -->|成功| PackMessage[打包消息<br/>SKYNET_SOCKET_TYPE_DATA]
+    CheckRead -->|EOF| PackClose[打包关闭消息<br/>SKYNET_SOCKET_TYPE_CLOSE]
+    CheckRead -->|错误| PackError[打包错误消息<br/>SKYNET_SOCKET_TYPE_ERROR]
+    
+    RecvFrom --> PackUDP[打包UDP消息<br/>SKYNET_SOCKET_TYPE_UDP]
+    ForwardAccept --> PackAccept[打包接受消息<br/>SKYNET_SOCKET_TYPE_ACCEPT]
+    ForwardClose --> PackCloseMsg[打包关闭消息<br/>SKYNET_SOCKET_TYPE_CLOSE]
+    
+    PackMessage --> SkynetPoll[skynet_socket_poll<br/>skynet层处理]
+    PackClose --> SkynetPoll
+    PackError --> SkynetPoll
+    PackUDP --> SkynetPoll
+    PackAccept --> SkynetPoll
+    PackCloseMsg --> SkynetPoll
+    
+    SkynetPoll --> ForwardMsg[forward_message<br/>封装skynet消息]
+    
+    ForwardMsg --> ContextPush[skynet_context_push<br/>推送到服务消息队列]
+    
+    ContextPush --> ServiceMQ[服务消息队列<br/>等待处理]
+    
+    ServiceMQ --> ServiceHandle[服务消息处理<br/>lua回调函数]
+    
+    ServiceHandle --> End([处理完成])
+    
+    %% 样式定义
+    classDef startEnd fill:#ffcdd2,stroke:#d32f2f,stroke-width:2px
+    classDef process fill:#c8e6c9,stroke:#388e3c,stroke-width:2px
+    classDef decision fill:#fff3e0,stroke:#f57c00,stroke-width:2px
+    classDef skynet fill:#e1bee7,stroke:#7b1fa2,stroke-width:2px
+    
+    class Start,End startEnd
+    class EpollWait,SocketPoll,ForwardTCP,ForwardUDP,ForwardAccept,ForwardClose,ReadSocket,RecvFrom process
+    class CheckType,CheckRead decision
+    class PackMessage,PackClose,PackError,PackUDP,PackAccept,PackCloseMsg,SkynetPoll,ForwardMsg,ContextPush,ServiceMQ,ServiceHandle skynet

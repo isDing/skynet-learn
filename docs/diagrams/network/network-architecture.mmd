@@ -1,0 +1,72 @@
+graph TB
+    %% 应用层
+    subgraph APP["应用层"]
+        Gate[Gate服务]
+        Client[Client服务]
+        Game[Game服务]
+        Other[其他服务...]
+    end
+
+    %% skynet_socket层
+    subgraph SKYNET["skynet_socket层"]
+        SocketAPI[socket API]
+        SocketPoll[skynet_socket_poll]
+        SocketSend[skynet_socket_send]
+        SocketCmd[socket命令处理]
+    end
+
+    %% socket_server层
+    subgraph SERVER["socket_server层"]
+        SocketServer[socket_server]
+        CtrlPipe["控制管道<br/>recvctrl_fd/sendctrl_fd"]
+        SlotArray["slot[MAX_SOCKET]<br/>socket槽位数组"]
+        EventBuffer["事件缓冲区<br/>ev[MAX_EVENT]"]
+    end
+
+    %% IO多路复用层
+    subgraph IOMUX["IO多路复用层"]
+        Epoll["epoll_wait<br/>Linux"]
+        Kqueue["kqueue<br/>BSD/macOS"]
+        Select["select<br/>fallback"]
+    end
+
+    %% 系统内核层
+    subgraph KERNEL["系统内核层"]
+        NetStack["网络协议栈<br/>TCP/UDP"]
+        NetDev[网络设备驱动]
+        Hardware[网络硬件]
+    end
+
+    %% 连接关系
+    APP --> SocketAPI
+    SocketAPI --> SocketPoll
+    SocketAPI --> SocketSend
+    SocketPoll --> SocketServer
+    SocketSend --> CtrlPipe
+    SocketServer --> SlotArray
+    SocketServer --> EventBuffer
+    SocketServer --> Epoll
+    SocketServer --> Kqueue
+    SocketServer --> Select
+    Epoll --> NetStack
+    Kqueue --> NetStack
+    Select --> NetStack
+    NetStack --> NetDev
+    NetDev --> Hardware
+
+    %% 数据流向
+    SocketPoll -.->|消息投递| APP
+    CtrlPipe -.->|控制命令| SocketServer
+
+    %% 样式定义
+    classDef appLayer fill:#e1f5fe,stroke:#01579b,stroke-width:2px
+    classDef skynetLayer fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
+    classDef serverLayer fill:#e8f5e8,stroke:#1b5e20,stroke-width:2px
+    classDef ioLayer fill:#fff3e0,stroke:#e65100,stroke-width:2px
+    classDef kernelLayer fill:#fce4ec,stroke:#880e4f,stroke-width:2px
+
+    class Gate,Client,Game,Other appLayer
+    class SocketAPI,SocketPoll,SocketSend,SocketCmd skynetLayer
+    class SocketServer,CtrlPipe,SlotArray,EventBuffer serverLayer
+    class Epoll,Kqueue,Select ioLayer
+    class NetStack,NetDev,Hardware kernelLayer

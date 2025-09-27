@@ -15,6 +15,7 @@ sp_invalid(int efd) {
 	return efd == -1;
 }
 
+// 创建epoll实例
 static int
 sp_create() {
 	return epoll_create(1024);
@@ -25,6 +26,7 @@ sp_release(int efd) {
 	close(efd);
 }
 
+// 添加socket到epoll
 static int 
 sp_add(int efd, int sock, void *ud) {
 	struct epoll_event ev;
@@ -41,6 +43,7 @@ sp_del(int efd, int sock) {
 	epoll_ctl(efd, EPOLL_CTL_DEL, sock , NULL);
 }
 
+// 修改socket事件
 static int
 sp_enable(int efd, int sock, void *ud, bool read_enable, bool write_enable) {
 	struct epoll_event ev;
@@ -52,13 +55,14 @@ sp_enable(int efd, int sock, void *ud, bool read_enable, bool write_enable) {
 	return 0;
 }
 
+// 等待事件
 static int 
 sp_wait(int efd, struct event *e, int max) {
 	struct epoll_event ev[max];
-	int n = epoll_wait(efd , ev, max, -1);
+	int n = epoll_wait(efd , ev, max, -1);  // 阻塞等待
 	int i;
 	for (i=0;i<n;i++) {
-		e[i].s = ev[i].data.ptr;
+		e[i].s = ev[i].data.ptr;  // socket指针
 		unsigned flag = ev[i].events;
 		e[i].write = (flag & EPOLLOUT) != 0;
 		e[i].read = (flag & EPOLLIN) != 0;

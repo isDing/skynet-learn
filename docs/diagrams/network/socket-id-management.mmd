@@ -1,0 +1,97 @@
+graph TB
+    subgraph IDAllocation["ID分配机制"]
+        AtomicID["alloc_id<br/>原子计数器"]
+        ReserveFunc["reserve_id函数<br/>原子递增"]
+        IDRange["ID范围: 1~0x7fffffff<br/>避免0和负数"]
+    end
+    
+    subgraph HashMapping["HASH映射机制"]
+        HashFunc["HASH_ID宏<br/>id & MAX_SOCKET_MASK"]
+        SlotIndex["槽位索引<br/>hash值 % MAX_SOCKET"]
+        HashCollision["哈希冲突处理<br/>线性探测"]
+    end
+    
+    subgraph VersionControl["版本号机制"]
+        SocketID["socket->id<br/>完整ID"]
+        SlotVersion["槽位版本号<br/>高16位"]
+        SlotIndex2["槽位索引<br/>低16位"]
+        VersionCheck["版本号校验<br/>防止ABA问题"]
+    end
+    
+    subgraph SlotReuse["槽位复用机制"]
+        FreeSlot["释放槽位<br/>type = SOCKET_TYPE_INVALID"]
+        SlotSearch["查找空闲槽位<br/>线性搜索"]
+        SlotAlloc["分配槽位<br/>设置type和id"]
+        SlotWrap["槽位循环<br/>到达末尾回到开头"]
+    end
+    
+    subgraph IDLifecycle["ID生命周期"]
+        Create[创建: reserve_id]
+        Bind[绑定: new_fd]
+        Use[使用: socket操作]
+        Release[释放: force_close]
+        Invalid[无效: SOCKET_TYPE_INVALID]
+    end
+    
+    %% 流程连接
+    AtomicID --> ReserveFunc
+    ReserveFunc --> IDRange
+    IDRange --> HashFunc
+    HashFunc --> SlotIndex
+    SlotIndex --> HashCollision
+    
+    SocketID --> SlotVersion
+    SocketID --> SlotIndex2
+    SlotVersion --> VersionCheck
+    VersionCheck --> SlotSearch
+    
+    FreeSlot --> SlotSearch
+    SlotSearch --> SlotAlloc
+    SlotAlloc --> SlotWrap
+    SlotWrap --> FreeSlot
+    
+    Create --> Bind
+    Bind --> Use
+    Use --> Release
+    Release --> Invalid
+    Invalid --> Create
+    
+    %% 详细说明框
+    subgraph Details["实现细节"]
+        Detail1["MAX_SOCKET = 2^16 = 65536<br/>最大socket数量"]
+        Detail2["HASH冲突时线性探测<br/>最多搜索MAX_SOCKET次"]
+        Detail3["ID递增保证唯一性<br/>32位整数约43亿个ID"]
+        Detail4["版本号防止槽位复用<br/>引起的ID混淆"]
+        Detail5["type字段标识槽位状态<br/>INVALID/RESERVE/PLISTEN等"]
+    end
+    
+    %% 示例流程
+    subgraph Example["示例流程"]
+        Step1["1. alloc_id = 12345<br/>原子递增获取ID"]
+        Step2["2. hash = 12345 & 0xFFFF<br/>计算哈希值"]
+        Step3["3. slot_index = hash % 65536<br/>确定槽位"]
+        Step4["4. 检查slot[index].type<br/>是否为INVALID"]
+        Step5["5. 设置socket->id = 12345<br/>绑定ID到槽位"]
+    end
+    
+    Step1 --> Step2
+    Step2 --> Step3
+    Step3 --> Step4
+    Step4 --> Step5
+    
+    %% 样式定义
+    classDef allocStyle fill:#e3f2fd,stroke:#0277bd,stroke-width:2px
+    classDef hashStyle fill:#e8f5e8,stroke:#1b5e20,stroke-width:2px
+    classDef versionStyle fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
+    classDef reuseStyle fill:#fff3e0,stroke:#e65100,stroke-width:2px
+    classDef lifecycleStyle fill:#fce4ec,stroke:#880e4f,stroke-width:2px
+    classDef detailStyle fill:#f1f8e9,stroke:#33691e,stroke-width:2px
+    classDef exampleStyle fill:#e0f2f1,stroke:#00695c,stroke-width:2px
+    
+    class AtomicID,ReserveFunc,IDRange allocStyle
+    class HashFunc,SlotIndex,HashCollision hashStyle
+    class SocketID,SlotVersion,SlotIndex2,VersionCheck versionStyle
+    class FreeSlot,SlotSearch,SlotAlloc,SlotWrap reuseStyle
+    class Create,Bind,Use,Release,Invalid lifecycleStyle
+    class Detail1,Detail2,Detail3,Detail4,Detail5 detailStyle
+    class Step1,Step2,Step3,Step4,Step5 exampleStyle

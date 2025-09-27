@@ -1,0 +1,93 @@
+graph TB
+    subgraph SocketServer["socket_server结构体"]
+        EventFd["event_fd<br/>epoll/kqueue文件描述符"]
+        RecvCtrl["recvctrl_fd<br/>控制管道读端"]
+        SendCtrl["sendctrl_fd<br/>控制管道写端"]
+        CheckCtrl["checkctrl<br/>控制标志位"]
+        EventN["event_n<br/>当前事件数量"]
+        EventIndex["event_index<br/>事件处理索引"]
+        MaxEvent["MAX_EVENT<br/>最大事件数量"]
+        AllocId["alloc_id<br/>socket ID分配器"]
+        UdpBuffer["udp_buffer<br/>UDP接收缓冲区"]
+    end
+    
+    subgraph SlotArray["slot[MAX_SOCKET]数组"]
+        Slot0["slot[0]"]
+        Slot1["slot[1]"]
+        SlotDots[...]
+        SlotMax["slot[MAX_SOCKET-1]"]
+    end
+    
+    subgraph SocketStruct["socket结构体"]
+        Type["type<br/>socket类型"]
+        Id["id<br/>socket ID"]
+        Fd["fd<br/>文件描述符"]
+        Size["size<br/>协议头大小"]
+        Opaque["opaque<br/>关联服务句柄"]
+        WbSize["wb_size<br/>写缓冲区大小"]
+        WarnSize["warn_size<br/>警告大小"]
+        DwBuffer["dw_buffer<br/>直写缓冲区"]
+        DwSize["dw_size<br/>直写大小"]
+    end
+    
+    subgraph WriteBuffer["写缓冲区结构"]
+        HighHead["high.head<br/>高优先级队列头"]
+        HighTail["high.tail<br/>高优先级队列尾"]
+        LowHead["low.head<br/>低优先级队列头"]
+        LowTail["low.tail<br/>低优先级队列尾"]
+    end
+    
+    subgraph BufferNode["write_buffer节点"]
+        Ptr["ptr<br/>数据指针"]
+        Sz["sz<br/>数据大小"]
+        Buffer["buffer<br/>实际数据"]
+        UseFlag["userobject<br/>用户对象标志"]
+        Next["next<br/>下一个节点"]
+    end
+    
+    subgraph EventArray["事件数组"]
+        Ev0["ev[0]"]
+        Ev1["ev[1]"]
+        EvDots[...]
+        EvMax["ev[MAX_EVENT-1]"]
+    end
+    
+    subgraph EventStruct["event结构体"]
+        EventS["s<br/>socket指针"]
+        EventRead["read<br/>可读标志"]
+        EventWrite["write<br/>可写标志"]
+        EventError["error<br/>错误标志"]
+        EventEOF["eof<br/>EOF标志"]
+    end
+    
+    %% 连接关系
+    SocketServer --> SlotArray
+    SlotArray --> SocketStruct
+    SocketStruct --> WriteBuffer
+    WriteBuffer --> BufferNode
+    BufferNode --> Next
+    SocketServer --> EventArray
+    EventArray --> EventStruct
+    
+    %% ID映射关系
+    AllocId -.->|HASH_ID| SlotArray
+    Id -.->|版本号| SocketStruct
+    
+    %% 控制管道关系
+    SendCtrl -.->|写入命令| RecvCtrl
+    RecvCtrl -.->|读取命令| EventFd
+    
+    %% 样式定义
+    classDef serverStyle fill:#e8f5e8,stroke:#1b5e20,stroke-width:2px
+    classDef slotStyle fill:#e3f2fd,stroke:#0277bd,stroke-width:2px
+    classDef socketStyle fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
+    classDef bufferStyle fill:#fff3e0,stroke:#e65100,stroke-width:2px
+    classDef eventStyle fill:#fce4ec,stroke:#880e4f,stroke-width:2px
+    classDef nodeStyle fill:#e0f2f1,stroke:#00695c,stroke-width:2px
+    
+    class EventFd,RecvCtrl,SendCtrl,CheckCtrl,EventN,EventIndex,MaxEvent,AllocId,UdpBuffer serverStyle
+    class Slot0,Slot1,SlotDots,SlotMax slotStyle
+    class Type,Id,Fd,Size,Opaque,WbSize,WarnSize,DwBuffer,DwSize socketStyle
+    class HighHead,HighTail,LowHead,LowTail bufferStyle
+    class Ev0,Ev1,EvDots,EvMax,EventS,EventRead,EventWrite,EventError,EventEOF eventStyle
+    class Ptr,Sz,Buffer,UseFlag,Next nodeStyle

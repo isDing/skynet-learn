@@ -6,11 +6,11 @@
 typedef int poll_fd;
 
 struct event {
-	void * s;
-	bool read;
-	bool write;
-	bool error;
-	bool eof;
+	void * s;      // socket指针
+	bool read;     // 可读事件
+	bool write;    // 可写事件
+	bool error;    // 错误事件
+	bool eof;      // 连接关闭事件
 };
 
 static bool sp_invalid(poll_fd fd);

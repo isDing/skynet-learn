@@ -1,0 +1,118 @@
+graph TB
+    subgraph BufferStructure["📊 写缓冲区结构"]
+        WriteBuffer[wb: write_buffer]
+        HighQueue[high队列<br/>控制消息优先]
+        LowQueue[low队列<br/>普通数据]
+        TotalSize[wb_size<br/>总缓冲区大小]
+    end
+    
+    subgraph QueueStructure["🔗 队列结构"]
+        HighHead[high.head<br/>高优先级队列头]
+        HighTail[high.tail<br/>高优先级队列尾]
+        LowHead[low.head<br/>低优先级队列头]
+        LowTail[low.tail<br/>低优先级队列尾]
+    end
+    
+    subgraph BufferNode["📄 缓冲区节点"]
+        NodePtr[ptr<br/>数据指针]
+        NodeSize[sz<br/>数据大小]
+        NodeBuffer[buffer<br/>实际数据]
+        NodeUser[userobject<br/>用户对象标志]
+        NodeNext[next<br/>下一个节点指针]
+    end
+    
+    subgraph DirectWrite["⚡ 直写模式"]
+        DirectCheck[检查写缓冲区是否为空]
+        DirectSend[send_socket<br/>直接发送到内核]
+        DirectResult[发送结果判断]
+    end
+    
+    subgraph BufferWrite["📝 缓冲写模式"]
+        AppendBuffer[append_sendbuffer<br/>添加到写缓冲区]
+        ChooseQueue[选择队列<br/>high或low]
+        AddToTail[添加到队列尾部]
+        UpdateSize[更新wb_size]
+    end
+    
+    subgraph SendProcess["📤 发送处理"]
+        SendHigh[发送high队列<br/>优先处理控制消息]
+        SendLow[发送low队列<br/>处理普通数据]
+        PartialSend[部分发送处理<br/>更新ptr和sz]
+        CompleteNode[完整节点发送<br/>释放节点内存]
+    end
+    
+    subgraph FlowControl["🚦 流量控制"]
+        WarnSize[warn_size<br/>警告阈值]
+        SizeCheck[检查缓冲区大小]
+        Warning[发送警告消息<br/>SOCKET_WARNING]
+        Blocking[阻塞写入<br/>防止内存爆炸]
+    end
+    
+    %% 连接关系
+    WriteBuffer --> HighQueue
+    WriteBuffer --> LowQueue
+    WriteBuffer --> TotalSize
+    
+    HighQueue --> HighHead
+    HighQueue --> HighTail
+    LowQueue --> LowHead
+    LowQueue --> LowTail
+    
+    HighHead --> NodePtr
+    HighTail --> NodePtr
+    LowHead --> NodePtr
+    LowTail --> NodePtr
+    
+    NodePtr --> NodeSize
+    NodeSize --> NodeBuffer
+    NodeBuffer --> NodeUser
+    NodeUser --> NodeNext
+    
+    %% 处理流程
+    DirectCheck -->|空闲| DirectSend
+    DirectCheck -->|有数据| AppendBuffer
+    DirectSend --> DirectResult
+    DirectResult -->|部分发送| AppendBuffer
+    DirectResult -->|EAGAIN| AppendBuffer
+    DirectResult -->|完成| End([发送完成])
+    
+    AppendBuffer --> ChooseQueue
+    ChooseQueue -->|控制消息| HighTail
+    ChooseQueue -->|普通数据| LowTail
+    HighTail --> AddToTail
+    LowTail --> AddToTail
+    AddToTail --> UpdateSize
+    
+    UpdateSize --> SizeCheck
+    SizeCheck -->|超过警告| Warning
+    SizeCheck -->|正常| SendProcess
+    Warning --> Blocking
+    
+    SendProcess --> SendHigh
+    SendHigh -->|队列空| SendLow
+    SendHigh -->|有数据| PartialSend
+    SendLow --> PartialSend
+    PartialSend -->|完成| CompleteNode
+    PartialSend -->|部分| UpdateNode[更新节点指针]
+    CompleteNode --> NextNode[处理下一个节点]
+    UpdateNode --> NextNode
+    NextNode --> SendProcess
+    
+    %% 样式定义
+    classDef structStyle fill:#e3f2fd,stroke:#0277bd,stroke-width:2px
+    classDef queueStyle fill:#e8f5e8,stroke:#1b5e20,stroke-width:2px
+    classDef nodeStyle fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
+    classDef directStyle fill:#fff3e0,stroke:#e65100,stroke-width:2px
+    classDef bufferStyle fill:#fce4ec,stroke:#880e4f,stroke-width:2px
+    classDef sendStyle fill:#e0f2f1,stroke:#00695c,stroke-width:2px
+    classDef flowStyle fill:#f1f8e9,stroke:#33691e,stroke-width:2px
+    classDef endStyle fill:#ffcdd2,stroke:#d32f2f,stroke-width:2px
+    
+    class WriteBuffer,HighQueue,LowQueue,TotalSize structStyle
+    class HighHead,HighTail,LowHead,LowTail queueStyle
+    class NodePtr,NodeSize,NodeBuffer,NodeUser,NodeNext nodeStyle
+    class DirectCheck,DirectSend,DirectResult directStyle
+    class AppendBuffer,ChooseQueue,AddToTail,UpdateSize bufferStyle
+    class SendHigh,SendLow,PartialSend,CompleteNode,SendProcess,UpdateNode,NextNode sendStyle
+    class WarnSize,SizeCheck,Warning,Blocking flowStyle
+    class End endStyle
