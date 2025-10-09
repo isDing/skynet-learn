@@ -135,6 +135,8 @@ struct skynet_context {
 
 ### 2.2 服务创建：skynet_context_new 完整流程
 
+> 相关源码：`skynet-src/skynet_server.c:130`
+
 ```c
 struct skynet_context * 
 skynet_context_new(const char * name, const char *param) {
@@ -148,6 +150,7 @@ skynet_context_new(const char * name, const char *param) {
     
     // 第三步：分配上下文内存
     struct skynet_context * ctx = skynet_malloc(sizeof(*ctx));
+    CHECKCALLING_INIT(ctx)
     
     // 第四步：初始化上下文字段
     ctx->mod = mod;
@@ -156,32 +159,47 @@ skynet_context_new(const char * name, const char *param) {
     ctx->cb = NULL;
     ctx->cb_ud = NULL;
     ctx->session_id = 0;
+    ATOM_INIT(&ctx->logfile, (uintptr_t)NULL);
     ctx->init = false;
     ctx->endless = false;
-    // ... 其他字段初始化
+    ctx->cpu_cost = 0;
+    ctx->cpu_start = 0;
+    ctx->message_count = 0;
+    ctx->profile = G_NODE.profile;
 
     // 第五步：注册句柄
-    ctx->handle = 0;  // 先设为 0，避免未初始化访问
+    ctx->handle = 0;  // 先设为 0，避免 skynet_handle_retireall 读取未初始化句柄
     ctx->handle = skynet_handle_register(ctx);
     
     // 第六步：创建消息队列
     struct message_queue * queue = ctx->queue = skynet_mq_create(ctx->handle);
     
-    // 第七步：增加全局服务计数
+    // 第七步：增加全局服务计数（init 可能用到 handle，因此放到后面）
     context_inc();
 
     // 第八步：调用服务初始化函数
+    CHECKCALLING_BEGIN(ctx)
     int r = skynet_module_instance_init(mod, inst, ctx, param);
+    CHECKCALLING_END(ctx)
     
     // 第九步：处理初始化结果
     if (r == 0) {
-        ctx->init = true;
-        skynet_globalmq_push(queue);  // 将队列加入全局队列
-        skynet_error(ret, "LAUNCH %s %s", name, param ? param : "");
-        return ctx;
+        struct skynet_context * ret = skynet_context_release(ctx);
+        if (ret) {
+            ctx->init = true;
+        }
+        skynet_globalmq_push(queue);
+        if (ret) {
+            skynet_error(ret, "LAUNCH %s %s", name, param ? param : "");
+        }
+        return ret;
     } else {
         // 初始化失败，清理资源
+        skynet_error(ctx, "error: launch %s FAILED", name);
+        uint32_t handle = ctx->handle;
+        skynet_context_release(ctx);
         skynet_handle_retire(handle);
+        struct drop_t d = { handle };
         skynet_mq_release(queue, drop_message, &d);
         return NULL;
     }
@@ -211,6 +229,8 @@ flowchart TD
 ```
 
 ### 2.3 消息分发：dispatch_message 机制
+
+> 相关源码：`skynet-src/skynet_server.c:284`
 
 ```c
 static void
@@ -260,7 +280,11 @@ dispatch_message(struct skynet_context *ctx, struct skynet_message *msg) {
 4. **回调处理**：调用服务注册的回调函数处理消息
 5. **内存管理**：根据回调返回值决定是否释放消息数据
 
+> 监控点：工作线程调度消息时会在分发前/后触发 `skynet_monitor_trigger`（见 `skynet-src/skynet_server.c:358` 与 `skynet-src/skynet_server.c:366`，位于 `skynet_context_message_dispatch` 内），用于检测卡顿或长耗时处理。
+
 ### 2.4 命令系统：command_func 数组和各命令实现
+
+> 相关源码：`skynet-src/skynet_server.c:421`、`skynet-src/skynet_server.c:680`
 
 ```c
 static struct command_func cmd_funcs[] = {
@@ -323,6 +347,8 @@ cmd_reg(struct skynet_context * context, const char * param) {
 
 ### 2.5 服务间通信：skynet_send 系列函数
 
+> 相关源码：`skynet-src/skynet_server.c:735`
+
 ```c
 int
 skynet_send(struct skynet_context * context, uint32_t source, 
@@ -383,7 +409,103 @@ skynet_send(struct skynet_context * context, uint32_t source,
 | **内存管理** | 支持零拷贝（PTYPE_TAG_DONTCOPY）|
 | **分布式支持** | 自动识别远程句柄，透明转发 |
 
-### 2.6 引用计数和内存管理
+### 2.6 消息生命周期时序示例
+
+> 相关源码：`skynet-src/skynet_server.c:735`、`skynet-src/skynet_server.c:253`、`skynet-src/skynet_server.c:284`、`skynet-src/skynet_mq.c:194`
+
+```mermaid
+sequenceDiagram
+    participant A as 服务A(ctx_A)
+    participant MQ as 全局/服务队列
+    participant B as 服务B(ctx_B)
+
+    A->>A: skynet_send(..., destination=B)
+    A->>A: _filter_args / session 分配
+    A->>MQ: skynet_context_push(B, msg)
+    MQ-->>B: skynet_mq_push / pop
+    B->>B: dispatch_message(ctx_B, msg)
+    B->>B: cb(ctx_B, ...)
+    B->>MQ: (reserve?释放消息数据)
+```
+
+**消息流转步骤**：
+1. **发起发送**：A 服务通过 `skynet_send` 完成参数校验与会话号准备（`skynet-src/skynet_server.c:735`）。
+2. **入队路由**：调用 `skynet_context_push`，将消息塞入目标服务的私有队列，如果目标队列当前空闲会立刻挂到全局队列（`skynet-src/skynet_server.c:253`、`skynet-src/skynet_mq.c:194`）。
+3. **调度消费**：工作线程从全局队列取出 B 服务的队列，调用 `dispatch_message` 进入服务回调（`skynet-src/skynet_server.c:284`）。
+4. **回调处理**：若回调返回 0，框架负责释放消息数据；返回非 0 时由业务侧保存数据并负责后续释放，确保无双重释放风险。
+
+该路径贯穿发送、排队、调度到消费的完整链路，定位消息延迟或丢失时可按此顺序逐点排查。
+
+### 2.7 调度、权重与过载监控
+
+> 相关源码：`skynet-src/skynet_server.c:326`（`skynet_context_message_dispatch`）
+
+```c
+struct message_queue * 
+skynet_context_message_dispatch(struct skynet_monitor *sm, struct message_queue *q, int weight) {
+    if (q == NULL) q = skynet_globalmq_pop();
+    if (q == NULL) return NULL;
+
+    uint32_t handle = skynet_mq_handle(q);
+    struct skynet_context * ctx = skynet_handle_grab(handle);
+    if (ctx == NULL) { skynet_mq_release(q, drop_message, &d); return skynet_globalmq_pop(); }
+
+    int i, n = 1;
+    for (i=0; i<n; i++) {
+        if (skynet_mq_pop(q,&msg)) { skynet_context_release(ctx); return skynet_globalmq_pop(); }
+        else if (i==0 && weight >= 0) { n = skynet_mq_length(q); n >>= weight; }
+
+        int overload = skynet_mq_overload(q);
+        if (overload) { skynet_error(ctx, "error: May overload, message queue length = %d", overload); }
+
+        skynet_monitor_trigger(sm, msg.source , handle);
+        (ctx->cb ? dispatch_message(ctx, &msg) : skynet_free(msg.data));
+        skynet_monitor_trigger(sm, 0, 0);
+    }
+    ...
+}
+```
+
+要点：
+- **权重调度**：`n = len >> weight`，在队列较长时批量处理，减小全局队列切换开销；`weight=-1` 表示始终处理 1 条。
+- **过载告警**：当 `skynet_mq_overload(q)` 返回非零，输出一次警告日志，提示队列积压。
+- **监控埋点**：分发前/后调用 `skynet_monitor_trigger`，支持定位卡线程和超时。
+
+### 2.8 名字解析与 sendname
+
+> 相关源码：`skynet-src/skynet_server.c:788`（`skynet_sendname`）、`skynet-src/skynet_server.c:380`（`skynet_queryname`）、`skynet-src/skynet_server.c:465`（`cmd_name`）、`skynet-src/skynet_handle.c:153`（名字表）
+
+规则与路径：
+- **地址格式**：`":<hex>"` 直指句柄；`".<local>"` 查本地名字表；其他字符串视为远程名，仅用于分布式转发。
+- **本地查询**：`.name` 通过 `skynet_handle_findname` 返回本地句柄；查不到返回 0。
+- **注册名字**：`REG .name` 或 `NAME .name :<hex>` 注册本地名字；C 层不支持注册全局名字（跨节点）。
+- **sendname 行为**：
+  - `:<hex>` → 等价于 `skynet_send` 本地/远程判定。
+  - `.<name>` → 解析为本地句柄，不存在则（在 `sendname` 中）释放数据并返回 `-1`。
+  - 其他字符串 → 构造 `remote_message`，拷贝 name 到 `rmsg->destination.name`，交由 harbor 层转发。
+
+### 2.9 消息类型标志与 destination=0 语义
+
+> 相关源码：`skynet-src/skynet_server.c:724`（`_filter_args`）、`skynet-src/skynet_server.c:736`（`skynet_send`）
+
+- **编码布局**：`msg->sz` 低 24 位为长度，高 8 位为类型；`PTYPE_TAG_DONTCOPY`/`PTYPE_TAG_ALLOCSESSION` 作为高位标志参与 `_filter_args` 处理。
+- **DONTCOPY 语义**：当标志存在且数据过大/目的无效，Skynet 会负责释放数据，避免泄漏。
+- **ALLOCSESSION 语义**：若 `session==0`，自动分配新会话号，常用于请求-响应模式。
+- **目的地为 0**：
+  - 若 `destination==0 && data!=NULL`，打印错误并释放数据，返回 `-1`。
+  - 若 `destination==0 && data==NULL`，不会报错，直接返回 `session`（适用于仅申请会话号等场景）。
+
+### 2.10 endless 状态与 STAT 统计
+
+> 相关源码：`skynet-src/skynet_server.c:266`（`skynet_context_endless`）、`skynet-src/skynet_server.c:558`（`cmd_stat`）
+
+- **endless 标志**：通过 `skynet_context_endless(handle)` 将 `context->endless=true`，用于标记可能的“消息取不完”状态，以便在下一次 `STAT endless` 查询时返回 `1` 并清零标记。
+- **STAT 查询**：
+  - `STAT mqlen`：当前队列长度
+  - `STAT endless`：是否曾触发 endless（返回后清零）
+  - `STAT cpu`/`STAT time`：累计 CPU 时间/当前消息处理耗时（需开启 `profile`）
+
+### 2.11 引用计数和内存管理
 
 ```c
 // 增加引用计数
@@ -430,6 +552,26 @@ delete_context(struct skynet_context *ctx) {
 - 每次 `grab` 操作增加引用
 - 每次 `release` 操作减少引用
 - 引用计数归零时自动释放所有资源
+
+### 2.12 服务退出与监控协作
+
+> 相关源码：`skynet-src/skynet_server.c:404`、`skynet-src/skynet_server.c:486`、`skynet-src/skynet_handle.c:79`
+
+服务的退出流程在命令层通过 `cmd_exit` / `cmd_kill` 调用 `handle_exit` 实现：
+
+1. **日志记录**：框架打印退出来源，便于排查误杀（`skynet-src/skynet_server.c:404`）。
+2. **监控上报**：若配置了 `G_NODE.monitor_exit`，会向监控服务发送一条客户端消息，便于统计或触发自愈策略。
+3. **句柄回收**：调用 `skynet_handle_retire` 清理句柄表并解绑名字，实现原子退出（`skynet-src/skynet_handle.c:79`）。
+4. **安全释放**：引用计数归零后，`delete_context` 负责关闭日志、回收队列并释放实例资源，确保无悬挂句柄。
+
+当需要整体停服时，`skynet_handle_retireall` 会遍历所有活跃句柄逐一退休，监控逻辑同样会收到逐服务的退出通知，方便实现灰度下线与错峰重启。
+
+### 2.13 线程本地状态与日志开关
+
+> 相关源码：`skynet-src/skynet_server.c:63`（`skynet_current_handle`）、`skynet-src/skynet_server.c:640`（`cmd_logon`）、`skynet-src/skynet_server.c:660`（`cmd_logoff`）
+
+- **TLS 句柄**：通过 `pthread_setspecific`/`pthread_getspecific` 维护当前工作线程正在处理的服务句柄，`skynet_current_handle()` 在主线程返回特殊负值（用于区分线程角色）。
+- **日志开关并发安全**：`LOGON`/`LOGOFF` 使用 `ATOM_CAS_POINTER` 对 `context->logfile` 原子切换，避免多线程重复打开/关闭同一日志文件。
 
 ## 3. skynet_handle.c 深度分析
 
@@ -747,6 +889,8 @@ _try_open(struct modules *m, const char * name) {
 
 ### 4.3 模块查询和缓存
 
+> 相关源码：`skynet-src/skynet_module.c:16`、`skynet-src/skynet_module.c:104`
+
 ```c
 struct modules {
     int count;                              // 已加载模块数量
@@ -792,7 +936,7 @@ skynet_module_query(const char * name) {
 
 **缓存机制**：
 - **一次加载**：模块只在首次使用时加载
-- **永久缓存**：加载后的模块不会被卸载
+- **永久缓存**：`struct modules` 作为进程级静态单例，不暴露卸载路径，模块常驻进程生命周期，避免符号被其他服务引用后失效
 - **双重检查**：避免并发加载同一模块
 - **容量限制**：最多缓存 32 种不同的模块类型
 
@@ -883,6 +1027,8 @@ graph TD
 2. **延迟释放**：避免使用中的内存被释放
 3. **内存池**：减少频繁分配/释放开销
 4. **零拷贝**：大消息传递时避免复制
+
+> 注意：C 模块通过 `modules.m[]` 永久缓存，必要的热更需配合进程重启或自定义卸载流程（`skynet-src/skynet_module.c:16`）。
 
 ### 5.3 性能优化技巧
 

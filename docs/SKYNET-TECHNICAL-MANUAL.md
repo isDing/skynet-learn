@@ -89,6 +89,10 @@
   - snlua服务
   - gate服务
 
+- [06-01-service-src-interactions.md](./bridge-layer/06-01-service-src-interactions.md)
+  - service-src 服务与主框架交互
+  - SNLua/Gate/Logger/Harbor 调用链与边界
+
 - [06-02-lua-c-extensions.md](./c-lua-bridge/06-02-lua-c-extensions.md)
   - Lua C扩展
   - API绑定
