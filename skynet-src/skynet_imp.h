@@ -4,14 +4,14 @@
 #include <string.h>
 
 struct skynet_config {
-	int thread;
-	int harbor;
-	int profile;
-	const char * daemon;
-	const char * module_path;
-	const char * bootstrap;
-	const char * logger;
-	const char * logservice;
+	int thread;              // 工作线程数量
+	int harbor;              // 集群节点 ID (1-255)
+	int profile;             // 是否开启性能分析
+	const char * daemon;     // 守护进程 PID 文件路径
+	const char * module_path; // C 服务模块搜索路径
+	const char * bootstrap;  // 启动命令（通常是 "snlua bootstrap"）
+	const char * logger;     // 日志文件路径
+	const char * logservice; // 日志服务名称（默认 "logger"）
 };
 
 #define THREAD_WORKER 0

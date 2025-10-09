@@ -62,3 +62,7 @@ Official Lua versions can also be used as long as the Makefile is edited.
 
 * Read Wiki for documents https://github.com/cloudwu/skynet/wiki (Written in both English and Chinese)
 * The FAQ in wiki https://github.com/cloudwu/skynet/wiki/FAQ (In Chinese, but you can visit them using something like Google or Deepl translate.)
+
+## Repository Guidelines
+
+See `AGENTS.md` for contributor practices, build/test workflows, and pull request expectations tailored to this fork.
