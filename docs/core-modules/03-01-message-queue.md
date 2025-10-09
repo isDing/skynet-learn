@@ -805,102 +805,146 @@ skynet_context_message_dispatch(struct skynet_context *ctx, ...) {
 
 ## 9. 使用示例和最佳实践
 
+本节示例基于实际实现规则修订，重点澄清三点：
+
+- PTYPE_LUA 载荷须为 lua-seri 编码，并非任意 C 结构体。
+- 消息内存的释放取决于是否使用 PTYPE_TAG_DONTCOPY 以及回调返回值（0 释放、1 保留）。
+- 全局队列 push 只在服务队列从空变非空时发生，勿以“减少全局队列操作”为由盲目合并消息。
+
 ### 9.1 高效的消息发送
 
-```c
-// 最佳实践：批量发送消息
-void batch_send(struct skynet_context *ctx, uint32_t dest) {
-    // 不好的做法：每次发送都可能触发全局队列操作
-    for (int i = 0; i < 100; i++) {
-        skynet_send(ctx, 0, dest, PTYPE_LUA, 0, data[i], size[i]);
-    }
-    
-    // 更好的做法：合并消息
-    struct batch_message {
-        int count;
-        void* data[100];
-        size_t size[100];
-    };
-    // 发送一个批量消息
-    skynet_send(ctx, 0, dest, PTYPE_LUA, 0, batch, sizeof(batch));
-}
+目标：减少协议封包次数与解析开销（而非错误地以为能显著减少全局队列操作）。
+
+- Lua→Lua：使用内置 `lua` 协议的 `pack/unpack` 批量封装。
+
+```lua
+-- 发送端（Lua）
+local skynet = require "skynet"
+
+-- 批量发送一组条目（以 lua 协议编码）
+local entries = { {id=1}, {id=2}, {id=3} }
+skynet.send(dest, "lua", "batch", entries)   -- 将由 lua 协议的 pack 打包
+
+-- 接收端（Lua）
+skynet.dispatch("lua", function(session, source, cmd, payload)
+    if cmd == "batch" then
+        for _, item in ipairs(payload) do
+            process(item)
+        end
+    end
+end)
 ```
 
-### 9.2 避免队列堵塞
+- C→Lua：不要把自定义 `struct` 直接当作 `PTYPE_LUA` 发送。若需 C 侧批量消息，使用 lua-seri 进行编码或改为自定义协议（注册独立的 pack/unpack）。
+
+提示：Skynet 调度已做批处理（同一队列按权重连续处理多条），无需因为“全局队列 push 次数”而强行把 100 条消息拼成一个未定义格式的结构体。
+
+### 9.2 避免队列堵塞（零拷贝转发与异步化）
+
+两种常见做法：
+
+1) 直接复制转发（简单但多一次内存复制）：
 
 ```c
-// 服务消息处理的最佳实践
-int
-message_handler(struct skynet_context *ctx, void *ud, 
-                int type, int session, 
-                uint32_t source, const void *msg, size_t sz) {
-    
-    // 1. 快速处理，避免阻塞
+// 在回调中：转发到 worker，由框架复制一份数据并发送
+// 当前消息回调返回 0，框架会在回调后释放“当前这份”消息
+int message_handler(struct skynet_context *ctx, void *ud,
+                    int type, int session,
+                    uint32_t source, const void *msg, size_t sz) {
     if (need_heavy_work(msg)) {
-        // 将繁重工作委托给其他服务
-        skynet_send(ctx, 0, worker_service, type, session, msg, sz);
-        return 0;
+        // 复制一份由框架管理的消息发给 worker
+        skynet_send(ctx, 0, worker_service, type, session, (void *)msg, sz);
+        return 0; // 当前消息交由框架释放
     }
-    
-    // 2. 避免在消息处理中等待
-    // 不好：
-    // result = blocking_call();  // 阻塞整个服务
-    
-    // 好：
-    async_call(callback);  // 异步处理
-    
+    async_schedule();
     return 0;
 }
 ```
 
-### 9.3 内存管理最佳实践
+2) 零拷贝转发（高效，但必须同时“保留当前消息”）：
 
 ```c
-// 正确的内存管理
-void send_message(struct skynet_context *ctx) {
-    // 1. 分配内存
+// 关键点：
+// - 发送时加 PTYPE_TAG_DONTCOPY，避免复制
+// - 回调返回 1，表示不由框架释放当前消息；由后续链路或最终消费者负责释放
+int message_handler(struct skynet_context *ctx, void *ud,
+                    int type, int session,
+                    uint32_t source, const void *msg, size_t sz) {
+    if (need_heavy_work(msg)) {
+        skynet_send(ctx, 0, worker_service, type | PTYPE_TAG_DONTCOPY, session, (void *)msg, sz);
+        return 1; // 保留当前消息所有权，避免双重释放
+    }
+    async_schedule();
+    return 0;
+}
+```
+
+说明：是否沿用原 `session` 取决于业务语义——需要 worker 直接回应给最初请求方时应保留，否则可生成新会话。
+
+### 9.3 内存管理最佳实践（发送端/接收端所有权）
+
+区分两种发送语义：
+
+- 复制发送（默认）：
+
+```c
+void send_copy(struct skynet_context *ctx, uint32_t dest) {
     char *data = skynet_malloc(1024);
-    
-    // 2. 填充数据
     snprintf(data, 1024, "Hello");
-    
-    // 3. 发送（所有权转移）
+    // 不加 PTYPE_TAG_DONTCOPY：框架会复制一份给接收方
     skynet_send(ctx, 0, dest, PTYPE_LUA, 0, data, 1024);
-    // 注意：这里不要 free(data)，接收方负责释放
-}
-
-// 接收方
-int handle_message(..., const void *msg, size_t sz) {
-    // 处理消息
-    process(msg);
-    
-    // 负责释放（如果需要）
-    if (need_free) {
-        skynet_free((void*)msg);
-    }
-    
-    return 0;
+    // 发送后，仍需释放原 data（因为框架复制了另外一份）
+    skynet_free(data);
 }
 ```
 
-### 9.4 队列配置建议
+- 转移所有权（零拷贝）：
 
 ```c
-// 根据服务类型调整队列参数
-// 1. 高频服务：增大初始容量
-#define HIGH_FREQ_QUEUE_SIZE 256
+void send_move(struct skynet_context *ctx, uint32_t dest) {
+    char *data = skynet_malloc(1024);
+    snprintf(data, 1024, "Hello");
+    // 加 PTYPE_TAG_DONTCOPY：不复制，所有权随消息转移到接收服务链路
+    skynet_send(ctx, 0, dest, PTYPE_LUA | PTYPE_TAG_DONTCOPY, 0, data, 1024);
+    // 此时发送端不得再 free(data)
+}
 
-// 2. 调整过载阈值
-q->overload_threshold = 2048;  // 对于预期高负载的服务
-
-// 3. 监控和调优
-if (skynet_mq_length(q) > 1000) {
-    // 考虑：
-    // - 增加处理线程
-    // - 优化消息处理逻辑
-    // - 消息分流到多个服务
+// 接收端（C 回调）
+// - 回调返回 0：框架在回调后释放消息
+// - 回调返回 1：框架不释放，由业务自行释放或继续转发
+int handle_message(struct skynet_context *ctx, void *ud,
+                   int type, int session, uint32_t source,
+                   const void *msg, size_t sz) {
+    process(msg, sz);
+    return 0;   // 让框架释放本条消息
 }
 ```
+
+Lua 层默认在 `dispatch_message` 中遵循相同语义：非 forward 模式下，消息使用完毕即由框架释放；启用 forward/手动保留时，需自行掌握释放/转发时机。
+
+### 9.4 队列配置与调优（可行做法）
+
+不要直接访问或修改 `struct message_queue` 的内部字段（例如 `overload_threshold`、初始容量等），这些属于内部实现，未通过公开 API 暴露。
+
+推荐做法：
+
+- 监控与告警：
+
+```c
+int len = skynet_mq_length(q);
+int overload = skynet_mq_overload(q);
+if (overload) {
+    skynet_error(ctx, "Message queue overload: %d", overload);
+}
+```
+
+- 限流与分流：
+  - 当队列长度超过业务阈值时，在业务层进行丢弃、降级或将消息分流到多个 worker。
+
+- 调度批量权重：
+  - 通过进程级调度权重（weight）影响一次批处理的条目数（参考 `skynet_context_message_dispatch` 的批处理策略）；不支持按单服务配置初始队列容量。
+
+如需更改默认容量或过载阈值，属于引擎级参数修改，需改动源码并重新编译，而非运行时可配。
 
 ## 10. 总结
 
