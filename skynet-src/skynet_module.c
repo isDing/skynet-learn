@@ -14,7 +14,7 @@
 #define MAX_MODULE_TYPE 32
 
 struct modules {
-	int count;              // modules的数量
+	int count;              // 已加载module的数量
 	struct spinlock lock;   // 自旋锁，避免多个线程同时向skynet_module写入数据，保证线程安全
 	const char * path;      // 由skynet配置表中的cpath指定，一般包含./cservice/?.so路径
 	struct skynet_module m[MAX_MODULE_TYPE];    // 存放服务模块的数组，最多32类
@@ -25,7 +25,7 @@ static struct modules * M = NULL;
 static void *
 _try_open(struct modules *m, const char * name) {
 	const char *l;
-	const char * path = m->path;
+	const char * path = m->path;  // 例如: "./cservice/?.so"
 	size_t path_size = strlen(path);
 	size_t name_size = strlen(name);
 
@@ -33,13 +33,16 @@ _try_open(struct modules *m, const char * name) {
 	//search path
 	void * dl = NULL;
 	char tmp[sz];
+    // 遍历路径列表（分号分隔）
 	do
 	{
 		memset(tmp,0,sz);
 		while (*path == ';') path++;
 		if (*path == '\0') break;
+        // 查找下一个分号
 		l = strchr(path, ';');
 		if (l == NULL) l = path + strlen(path);
+        // 构建实际路径，将 ? 替换为模块名
 		int len = l - path;
 		int i;
 		for (i=0;path[i]!='?' && i < len ;i++) {
@@ -52,6 +55,7 @@ _try_open(struct modules *m, const char * name) {
 			fprintf(stderr,"Invalid C service path\n");
 			exit(1);
 		}
+        // 尝试加载动态库
 		dl = dlopen(tmp, RTLD_NOW | RTLD_GLOBAL);
 		path = l;
 	}while(dl == NULL);
@@ -102,21 +106,25 @@ open_sym(struct skynet_module *mod) {
 
 struct skynet_module *
 skynet_module_query(const char * name) {
+    // 第一次查询（无锁）
 	struct skynet_module * result = _query(name);
 	if (result)
 		return result;
 
 	SPIN_LOCK(M)
 
+    // 双重检查（加锁后再查一次）
 	result = _query(name); // double check
 
 	if (result == NULL && M->count < MAX_MODULE_TYPE) {
+        // 尝试加载新模块
 		int index = M->count;
 		void * dl = _try_open(M,name);
 		if (dl) {
 			M->m[index].name = name;
 			M->m[index].module = dl;
 
+            // 绑定函数符号
 			if (open_sym(&M->m[index]) == 0) {
 				M->m[index].name = skynet_strdup(name);
 				M->count ++;

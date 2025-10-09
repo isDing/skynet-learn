@@ -3,9 +3,13 @@
 
 #include <stdint.h>
 
+// handle 的位域布局
+// |<- 8 bits ->|<--- 24 bits --->|
+// |  harbor_id |   local_handle  |
+
 // reserve high 8 bits for remote id
-#define HANDLE_MASK 0xffffff
-#define HANDLE_REMOTE_SHIFT 24
+#define HANDLE_MASK 0xffffff          // 低 24 位掩码
+#define HANDLE_REMOTE_SHIFT 24        // harbor 位移
 
 struct skynet_context;
 

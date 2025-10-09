@@ -42,26 +42,32 @@ skynet_handle_register(struct skynet_context *ctx) {
 	for (;;) {
 		int i;
 		uint32_t handle = s->handle_index;
+        // 线性探测，寻找空槽
 		for (i=0;i<s->slot_size;i++,handle++) {
 			if (handle > HANDLE_MASK) {
 				// 0 is reserved
-				handle = 1;
+				handle = 1;  // 回绕，跳过 0
 			}
 			// 相当于 hash = handle % slot_size，因为 slot_size 是 2^n，所以用按位与替代取模
 			int hash = handle & (s->slot_size-1);
 			if (s->slot[hash] == NULL) {
+                // 找到空槽，分配
 				s->slot[hash] = ctx;
 				s->handle_index = handle + 1;
 
 				rwlock_wunlock(&s->lock);
 
+                // 加上 harbor id
 				handle |= s->harbor;
 				return handle;
 			}
 		}
+        // 所有槽位已满，需要扩容
 		assert((s->slot_size*2 - 1) <= HANDLE_MASK);
+        // 分配新的哈希表（容量翻倍）
 		struct skynet_context ** new_slot = skynet_malloc(s->slot_size * 2 * sizeof(struct skynet_context *));
 		memset(new_slot, 0, s->slot_size * 2 * sizeof(struct skynet_context *));
+        // 重新哈希所有元素
 		for (i=0;i<s->slot_size;i++) {
 			if (s->slot[i]) {
 				int hash = skynet_context_handle(s->slot[i]) & (s->slot_size * 2 - 1);
@@ -69,6 +75,7 @@ skynet_handle_register(struct skynet_context *ctx) {
 				new_slot[hash] = s->slot[i];
 			}
 		}
+        // 替换旧表
 		skynet_free(s->slot);
 		s->slot = new_slot;
 		s->slot_size *= 2;
@@ -157,6 +164,7 @@ skynet_handle_grab(uint32_t handle) {
 	return result;
 }
 
+// 查找名字（二分查找）
 uint32_t
 skynet_handle_findname(const char * name) {
 	struct handle_storage *s = H;
@@ -167,6 +175,7 @@ skynet_handle_findname(const char * name) {
 
 	int begin = 0;
 	int end = s->name_count - 1;
+    // 二分查找（名字数组有序）
 	while (begin<=end) {
 		int mid = (begin+end)/2;
 		struct handle_name *n = &s->name[mid];
@@ -213,8 +222,10 @@ _insert_name_before(struct handle_storage *s, char *name, uint32_t handle, int b
 	s->name_count ++;
 }
 
+// 插入名字（保持有序）
 static const char *
 _insert_name(struct handle_storage *s, const char * name, uint32_t handle) {
+    // 二分查找插入位置
 	int begin = 0;
 	int end = s->name_count - 1;
 	while (begin<=end) {
@@ -222,7 +233,7 @@ _insert_name(struct handle_storage *s, const char * name, uint32_t handle) {
 		struct handle_name *n = &s->name[mid];
 		int c = strcmp(n->name, name);
 		if (c==0) {
-			return NULL;
+			return NULL;  // 名字已存在
 		}
 		if (c<0) {
 			begin = mid + 1;
@@ -230,8 +241,10 @@ _insert_name(struct handle_storage *s, const char * name, uint32_t handle) {
 			end = mid - 1;
 		}
 	}
+    // 复制名字
 	char * result = skynet_strdup(name);
 
+    // 在 begin 位置插入
 	_insert_name_before(s, result, handle, begin);
 
 	return result;
