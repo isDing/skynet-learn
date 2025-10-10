@@ -4,6 +4,14 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+// Harbor ID编码规则
+// 32位句柄 = [8位Harbor ID][24位本地ID]
+//
+// 示例：
+// 0x01000001 = Harbor 1, Service 1
+// 0x02000100 = Harbor 2, Service 256
+// 0x00000001 = 单节点模式, Service 1
+
 #define GLOBALNAME_LENGTH 16
 #define REMOTE_MAX 256
 

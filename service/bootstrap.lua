@@ -13,6 +13,7 @@ skynet.start(function()
 		standalone = true
 		skynet.setenv("standalone", "true")
 
+		-- 单节点（harbor=0）：启动 cdummy 并命名 .cslave
 		local ok, slave = pcall(skynet.newservice, "cdummy")
 		if not ok then
 			skynet.abort()
@@ -20,6 +21,7 @@ skynet.start(function()
 		skynet.name(".cslave", slave)
 
 	else
+		-- 分布式（harbor>0）：按需启动 cmaster（standalone=true 时），启动 cslave 并命名 .cslave
 		if standalone then
 			if not pcall(skynet.newservice,"cmaster") then
 				skynet.abort()

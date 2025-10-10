@@ -108,53 +108,68 @@ Harbor采用主从架构管理节点间的连接和名字服务：
 
 ### 2.2 节点发现和注册机制
 
-节点启动和注册流程：
+本仓库实际实现由 `service/cslave.lua` 完成。与 Master 的交互使用“单字节长度 + packstring”的自定义包，握手、广播等协议标志均为单字符：
 
 ```lua
--- 1. Slave节点启动后连接到Master
-function connect_master()
-    local fd = socket.open(master_addr)
-    socket.write(fd, string.char(harbor_id))  -- 发送自己的Harbor ID
-    monitor_master(fd)  -- 监听Master的指令
+-- 打包/解包（service/cslave.lua:1,15）
+local function read_package(fd)
+    local sz = socket.read(fd, 1)
+    assert(sz, "closed")
+    sz = string.byte(sz)
+    local content = assert(socket.read(fd, sz), "closed")
+    return skynet.unpack(content)
 end
 
--- 2. Master接收Slave连接
-function accept_slave(fd)
-    local id = socket.read(fd, 1)  -- 读取Harbor ID
+local function pack_package(...)
+    local message = skynet.packstring(...)
+    local size = #message
+    assert(size <= 255 , "too long")
+    return string.char(size) .. message
+end
+
+-- Slave 连接 Master 并握手（service/cslave.lua:197）
+local master_fd = assert(socket.open(master_addr), "Can't connect to master")
+local hs_message = pack_package("H", harbor_id, slave_address)
+socket.write(master_fd, hs_message)
+local t, n = read_package(master_fd)
+assert(t == "W" and type(n) == "number", "slave shakehand failed")
+
+-- 接受其他 Slave 入站连接（service/cslave.lua:40,84）
+local function accept_slave(fd)
+    socket.start(fd)
+    local id = socket.read(fd, 1)
+    if not id then socket.close(fd); return end
+    id = string.byte(id)
+    assert(slaves[id] == nil, string.format("Slave %d exist (fd=%d)", id, fd))
     slaves[id] = fd
-    -- 广播新节点信息给其他Slave
-    broadcast_slave_info(id, address)
-end
-
--- 3. Slave间建立P2P连接
-function connect_slave(slave_id, address)
-    local fd = socket.open(address)
-    slaves[slave_id] = fd
-    -- 发送握手消息
-    socket.write(fd, string.char(my_harbor_id))
+    socket.abandon(fd)
+    -- 将 fd/id 通知 C 层 Harbor 服务，进入握手/队列分发
+    skynet.send(harbor_service, "harbor", string.format("A %d %d", fd, id))
 end
 ```
 
 ### 2.3 全局名字服务
 
-全局名字服务允许跨节点的服务发现：
+Lua 层对外提供了简洁 API（`lualib/skynet/harbor.lua`），由 `service/cslave.lua` 驱动与 Master 的同步：
 
-```c
-// 名字注册结构
-struct remote_name {
-    char name[GLOBALNAME_LENGTH];  // 16字节的全局名字
-    uint32_t handle;                // 服务句柄（含Harbor ID）
-};
-
-// 注册全局名字（Lua层）
+```lua
+-- lualib/skynet/harbor.lua:1
 function harbor.globalname(name, handle)
+    handle = handle or skynet.self()
     skynet.send(".cslave", "lua", "REGISTER", name, handle)
 end
 
-// 查询全局名字
 function harbor.queryname(name)
     return skynet.call(".cslave", "lua", "QUERYNAME", name)
 end
+```
+
+当收到 Master 的 `'N'`（名字更新）广播后，`cslave` 会缓存并转发给 C 层 Harbor：
+
+```lua
+-- service/cslave.lua:38,57
+globalname[id_name] = address
+skynet.redirect(harbor_service, address, "harbor", 0, "N " .. id_name)
 ```
 
 名字解析流程：
@@ -165,29 +180,48 @@ end
 
 ### 2.4 消息路由策略
 
-Harbor的消息路由采用智能路由策略：
+跨节点消息路由核心在 C 层 `service-src/service_harbor.c`：
 
 ```c
-// 远程消息发送决策
-int remote_send_handle(struct harbor *h, uint32_t source, 
-                      uint32_t destination, int type, int session, 
-                      const char * msg, size_t sz) {
+// 句柄路由（service-src/service_harbor.c:527）
+static int
+remote_send_handle(struct harbor *h, uint32_t source, uint32_t destination,
+                   int type, int session, const char * msg, size_t sz) {
     int harbor_id = destination >> HANDLE_REMOTE_SHIFT;
-    
+    struct skynet_context * context = h->ctx;
     if (harbor_id == h->id) {
-        // 本地消息，直接投递
-        skynet_send(context, source, destination, type, session, msg, sz);
+        // 本地消息：直接投递，且使用 PTYPE_TAG_DONTCOPY 避免多余拷贝
+        skynet_send(context, source, destination,
+                    type | PTYPE_TAG_DONTCOPY, session, (void *)msg, sz);
         return 1;
     }
-    
+
     struct slave * s = &h->s[harbor_id];
     if (s->fd == 0 || s->status == STATUS_HANDSHAKE) {
-        // 连接未就绪，缓存消息
-        push_queue(s->queue, msg, sz, &header);
+        if (s->status == STATUS_DOWN) {
+            // 目标不可达：回报 PTYPE_ERROR 并记录
+            skynet_send(context, destination, source, PTYPE_ERROR, session, NULL, 0);
+            skynet_error(context, "Drop message to harbor %d from %x to %x (session = %d, msgsz = %d)",
+                         harbor_id, source, destination, session, (int)sz);
+        } else {
+            // 连接未就绪：入队待发
+            if (s->queue == NULL) s->queue = new_queue();
+            struct remote_message_header header;
+            header.source = source;
+            header.destination = (type << HANDLE_REMOTE_SHIFT) | (destination & HANDLE_MASK);
+            header.session = (uint32_t)session;
+            push_queue(s->queue, (void *)msg, sz, &header);
+            return 1;
+        }
     } else {
-        // 直接发送
-        send_remote(h->ctx, s->fd, msg, sz, &header);
+        // 连接就绪：立即发送
+        struct remote_message_header cookie;
+        cookie.source = source;
+        cookie.destination = (destination & HANDLE_MASK) | ((uint32_t)type << HANDLE_REMOTE_SHIFT);
+        cookie.session = (uint32_t)session;
+        send_remote(context, s->fd, msg, sz, &cookie);
     }
+    return 0;
 }
 ```
 
@@ -237,9 +271,9 @@ struct harbor_msg {
     size_t size;          // 消息大小
 };
 
-// 网络传输格式
-// [4字节长度][12字节消息头][消息内容]
-// 长度采用大端序，第一字节必须为0（限制单个消息最大16MB）
+// 网络传输格式（发送：service-src/service_harbor.c:333；接收：service-src/service_harbor.c:466）
+// [4字节长度(大端)][消息体(原始payload)][12字节远程头]
+// 其中长度=payload+12；接收侧要求长度首字节为 0（24bit 长度，单条消息 < 16MB），否则判为过大并关闭连接
 ```
 
 消息类型编码在destination的高8位：
@@ -339,17 +373,17 @@ void skynet_harbor_start(void *ctx) {
 2. 保存服务上下文供消息转发使用
 3. 启动网络监听和连接
 
-### 4.3 skynet_harbor_register：注册全局名字
+### 4.3 注册全局名字（Lua 层）
 
-实际的注册在Lua层的cslave服务中实现：
+全局名字注册由 `service/cslave.lua` 的 `harbor.REGISTER` 处理：
 
 ```lua
--- cslave.lua中的注册逻辑
-local function register_name(name, handle)
+-- service/cslave.lua:160
+function harbor.REGISTER(fd, name, handle)
+    assert(globalname[name] == nil)
     globalname[name] = handle
-    -- 通知Master节点
-    socket.write(master_fd, pack_package("N", name, handle))
-    -- 通知Harbor服务
+    response_name(name)
+    socket.write(fd, pack_package("R", name, handle))
     skynet.redirect(harbor_service, handle, "harbor", 0, "N " .. name)
 end
 ```
@@ -378,46 +412,54 @@ void skynet_harbor_send(struct remote_message *rmsg, uint32_t source, int sessio
 
 ### 4.5 消息打包和解包
 
+与网络交互采用“长度(4B大端) + payload + 远程头(12B)”布局，分别对应 `send_remote` 与 `forward_local_messsage`：
+
 ```c
-// 消息打包（发送前）
-static void send_remote(struct skynet_context * ctx, int fd, 
-                       void * buffer, size_t sz, 
-                       struct remote_message_header * cookie) {
-    // 1. 计算总长度
+// 发送远程消息（service-src/service_harbor.c:333）
+static void
+send_remote(struct skynet_context * ctx, int fd, const char * buffer, size_t sz,
+            struct remote_message_header * cookie) {
     size_t sz_header = sz + sizeof(*cookie);
-    
-    // 2. 构造长度头（大端序）
-    uint8_t size_buf[4];
-    size_buf[0] = (sz_header >> 24) & 0xff;
-    size_buf[1] = (sz_header >> 16) & 0xff;
-    size_buf[2] = (sz_header >> 8) & 0xff;
-    size_buf[3] = sz_header & 0xff;
-    
-    // 3. 发送：长度 + 消息头 + 消息体
-    struct iovec vec[3] = {
-        { size_buf, 4 },
-        { cookie, sizeof(*cookie) },
-        { buffer, sz }
-    };
-    socket_writev(fd, vec, 3);
+    if (sz_header > UINT32_MAX) {
+        skynet_error(ctx, "remote message from :%08x to :%08x is too large.",
+                     cookie->source, cookie->destination);
+        return;
+    }
+    uint8_t sendbuf[sz_header+4];
+    to_bigendian(sendbuf, (uint32_t)sz_header);
+    memcpy(sendbuf+4, buffer, sz);
+    header_to_message(cookie, sendbuf+4+sz);
+
+    struct socket_sendbuffer tmp;
+    tmp.id = fd;
+    tmp.type = SOCKET_BUFFER_RAWPOINTER;
+    tmp.buffer = sendbuf;
+    tmp.sz = sz_header+4;
+    skynet_socket_sendbuffer(ctx, &tmp);
 }
 
-// 消息解包（接收后）
-static void forward_local_messsage(struct harbor *h, void *msg, int sz) {
-    struct remote_message_header *header = (struct remote_message_header *)msg;
-    
-    // 1. 解析目标和类型
-    uint32_t destination = header->destination;
+// 将远程消息转发为本地消息（service-src/service_harbor.c:316）
+static void
+forward_local_messsage(struct harbor *h, void *msg, int sz) {
+    const char * cookie = msg;
+    cookie += sz - HEADER_COOKIE_LENGTH; // HEADER_COOKIE_LENGTH = 12
+    struct remote_message_header header;
+    message_to_header((const uint32_t *)cookie, &header);
+
+    uint32_t destination = header.destination;
     int type = destination >> HANDLE_REMOTE_SHIFT;
-    destination = (destination & HANDLE_MASK) | (h->id << HANDLE_REMOTE_SHIFT);
-    
-    // 2. 提取消息内容
-    void * message = (char *)msg + sizeof(*header);
-    int size = sz - sizeof(*header);
-    
-    // 3. 投递到本地服务
-    skynet_send(h->ctx, header->source, destination, type, 
-                header->session, message, size);
+    destination = (destination & HANDLE_MASK) | ((uint32_t)h->id << HANDLE_REMOTE_SHIFT);
+
+    // 直接将 payload 作为消息体（不复制），交给本地服务
+    if (skynet_send(h->ctx, header.source, destination,
+                    type | PTYPE_TAG_DONTCOPY , (int)header.session,
+                    (void *)msg, sz-HEADER_COOKIE_LENGTH) < 0) {
+        if (type != PTYPE_ERROR)
+            skynet_send(h->ctx, destination, header.source , PTYPE_ERROR,
+                        (int)header.session, NULL, 0);
+        skynet_error(h->ctx, "Unknown destination :%x from :%x type(%d)",
+                     destination, header.source, type);
+    }
 }
 ```
 
@@ -425,40 +467,27 @@ static void forward_local_messsage(struct harbor *h, void *msg, int sz) {
 
 ### 5.1 节点间连接建立
 
-连接建立采用两种模式：
+实际握手流程由 `cslave` 与 C 层 Harbor 协作完成：
 
-**主动连接（Connect）**：
+- `cslave` 连接 Master，完成 `'H'`/`'W'` 握手后，开始监听其他 Slave，并在接入时读取其 id（单字节），随后向 C 层 Harbor 发送命令 `'A fd id'` 绑定该连接（service/cslave.lua:197,133）。
+- C 层 Harbor 在收到 `'S fd id'`（主动连接）或 `'A fd id'`（被动接入）后，由 `harbor_command` 调用 `handshake` 发送本端 id，并根据分支进入 `STATUS_HANDSHAKE` 或直接投递缓存队列（service-src/service_harbor.c:603,639）。
+
 ```c
-// Slave主动连接到其他节点
-static void connect_to_harbor(int harbor_id, const char *address) {
-    int fd = socket_connect(address);
-    // 发送自己的Harbor ID作为握手
-    uint8_t handshake = my_harbor_id;
-    socket_write(fd, &handshake, 1);
-    // 等待对方确认
-    uint8_t remote_id;
-    socket_read(fd, &remote_id, 1);
-    assert(remote_id == harbor_id);
+// 发送单字节握手 id（service-src/service_harbor.c:591）
+static void
+handshake(struct harbor *h, int id) {
+    struct slave *s = &h->s[id];
+    uint8_t handshake[1] = { (uint8_t)h->id };
+    struct socket_sendbuffer tmp;
+    tmp.id = s->fd;
+    tmp.type = SOCKET_BUFFER_RAWPOINTER;
+    tmp.buffer = handshake;
+    tmp.sz = 1;
+    skynet_socket_sendbuffer(h->ctx, &tmp);
 }
 ```
 
-**被动接受（Accept）**：
-```c
-// 接受其他节点的连接
-static void accept_harbor(int listen_fd) {
-    int fd = socket_accept(listen_fd);
-    // 读取对方的Harbor ID
-    uint8_t remote_id;
-    socket_read(fd, &remote_id, 1);
-    // 发送自己的ID确认
-    uint8_t handshake = my_harbor_id;
-    socket_write(fd, &handshake, 1);
-    // 保存连接
-    slaves[remote_id] = fd;
-}
-```
-
-### 5.2 故障检测和恢复
+<!-- ### 5.2 故障检测和恢复
 
 Harbor通过多种机制保证系统可靠性：
 
@@ -541,119 +570,61 @@ local function select_service()
 end
 ```
 
-**消息批处理**：
-```c
-// 批量发送消息减少网络开销
-static void flush_message_queue(struct harbor *h, int harbor_id) {
-    struct slave *s = &h->s[harbor_id];
-    struct harbor_msg *m;
-    
-    // 收集多个消息
-    int count = 0;
-    size_t total_size = 0;
-    while ((m = pop_queue(s->queue)) != NULL && count < MAX_BATCH) {
-        batch[count++] = m;
-        total_size += m->size;
-    }
-    
-    // 批量发送
-    if (count > 0) {
-        send_batch(s->fd, batch, count, total_size);
-    }
-}
-```
+**消息批处理**：Harbor 不内置批量写出；若需批处理，应在业务层合并多条小消息（如组装为一条 `PTYPE_LUA`），在接收方再拆分处理。 -->
 
 ## 与其他模块的协作
 
 ### 6.1 与消息队列系统的集成
 
-Harbor与消息队列系统紧密集成：
-
-```c
-// Harbor消息进入本地消息队列
-static void forward_local_messsage(struct harbor *h, void *msg, int sz) {
-    struct remote_message_header *header = (struct remote_message_header *)msg;
-    
-    // 解析消息
-    uint32_t destination = header->destination & HANDLE_MASK;
-    int type = header->destination >> HANDLE_REMOTE_SHIFT;
-    
-    // 构造本地消息
-    struct skynet_message message;
-    message.source = header->source;
-    message.session = header->session;
-    message.data = (char *)msg + sizeof(*header);
-    message.sz = sz - sizeof(*header) | (type << MESSAGE_TYPE_SHIFT);
-    
-    // 投递到目标服务的消息队列
-    skynet_context_push(destination, &message);
-}
-```
+Harbor 接收远程包后调用 `forward_local_messsage` 将其转为本地消息，内部通过 `skynet_send` 投递给目标服务（使用 `PTYPE_TAG_DONTCOPY` 避免额外拷贝），而非直接操作 `skynet_context_push`（service-src/service_harbor.c:316,345）。
 
 ### 6.2 与服务管理的配合
 
-Harbor与服务管理器协作处理服务生命周期：
+Harbor 与服务管理器的协作体现在启动流程及 `.cslave` 的存在：
 
-```lua
--- 服务创建时注册Harbor信息
-function launcher.launch(service_name, ...)
-    local handle = c.launch(service_name, ...)
-    -- 设置Harbor ID
-    local harbor_id = skynet.harbor()
-    handle = handle | (harbor_id << 24)
-    return handle
-end
-
--- 服务退出时清理Harbor资源
-function harbor.exit(handle)
-    -- 清理全局名字
-    for name, h in pairs(globalname) do
-        if h == handle then
-            globalname[name] = nil
-            -- 通知Master
-            notify_master("D", name)
-        end
-    end
-end
-```
+- `service/bootstrap.lua` 根据 `harbor`/`standalone` 环境变量选择启动 `cdummy`/`cslave`/`cmaster` 并命名 `.cslave`（用于名字注册/查询）。
+- 32 位句柄的 Harbor 高位由 C 层在注册 handle 时注入（`skynet-src/skynet_handle.c:61`），无需在 Lua 层手动位运算修改。
+- 服务退出的清理流程不由 Harbor 主动干预；全局名字清理需由业务自身在合适时机处理。
 
 ### 6.3 与网络层的交互
 
-Harbor直接使用Socket API进行网络通信：
+Harbor 的 Socket 事件在服务回调 `mainloop` 的 `PTYPE_SOCKET` 分支处理：
 
 ```c
-// 初始化网络监听
-static void harbor_listen(struct harbor *h, const char *host, int port) {
-    int listen_fd = skynet_socket_listen(h->ctx, host, port, 32);
-    skynet_socket_start(h->ctx, listen_fd);
-    
-    // 注册socket消息处理
-    skynet_callback(h->ctx, h, harbor_socket_cb);
-}
-
-// Socket消息回调
-static int harbor_socket_cb(struct skynet_context * context, 
-                           void *ud, int type, int session, 
-                           uint32_t source, const void * msg, size_t sz) {
-    struct harbor *h = (struct harbor *)ud;
-    const struct skynet_socket_message * message = msg;
-    
-    switch(message->type) {
-    case SKYNET_SOCKET_TYPE_CONNECT:
-        // 连接成功
-        handle_connect(h, message->id);
-        break;
-    case SKYNET_SOCKET_TYPE_DATA:
-        // 收到数据
-        push_socket_data(h, message);
-        break;
-    case SKYNET_SOCKET_TYPE_ERROR:
-    case SKYNET_SOCKET_TYPE_CLOSE:
-        // 连接断开
-        handle_disconnect(h, message->id);
-        break;
+// Socket 事件处理（service-src/service_harbor.c:703）
+static int
+mainloop(struct skynet_context * context, void * ud, int type, int session,
+         uint32_t source, const void * msg, size_t sz) {
+    struct harbor * h = ud;
+    switch (type) {
+    case PTYPE_SOCKET: {
+        const struct skynet_socket_message * message = msg;
+        switch(message->type) {
+        case SKYNET_SOCKET_TYPE_DATA:
+            push_socket_data(h, message);
+            skynet_free(message->buffer);
+            break;
+        case SKYNET_SOCKET_TYPE_ERROR:
+        case SKYNET_SOCKET_TYPE_CLOSE: {
+            int id = harbor_id(h, message->id);
+            if (id) report_harbor_down(h,id);
+            else skynet_error(context, "Unknown fd (%d) closed", message->id);
+            break;
+        }
+        case SKYNET_SOCKET_TYPE_CONNECT:
+            break;
+        case SKYNET_SOCKET_TYPE_WARNING: {
+            int id = harbor_id(h, message->id);
+            if (id) skynet_error(context, "message havn't send to Harbor (%d) reach %d K", id, message->ud);
+            break;
+        }
+        default:
+            skynet_error(context, "recv invalid socket message type %d", type);
+            break;
+        }
+        return 0;
     }
-    return 0;
+    // ... 其他类型处理
 }
 ```
 
@@ -661,27 +632,24 @@ static int harbor_socket_cb(struct skynet_context * context,
 
 ### 7.1 Harbor配置项
 
-基本配置示例：
+启动流程由 `service/bootstrap.lua` 协调：
 
 ```lua
--- config
--- 节点配置
-harbor = 1                          -- Harbor ID (1-255)，0表示单节点模式
-address = "127.0.0.1:2526"         -- 本节点监听地址
-master = "127.0.0.1:2013"          -- Master节点地址（仅Slave需要）
-standalone = "0.0.0.0:2013"        -- Master监听地址（仅Master需要）
+-- 单节点（harbor=0）：启动 cdummy 并命名 .cslave（service/bootstrap.lua:9,16）
+local ok, slave = pcall(skynet.newservice, "cdummy")
+skynet.name(".cslave", slave)
 
--- 启动Harbor服务
-if harbor ~= 0 then
-    if standalone then
-        -- Master模式
-        launcher.launch("cmaster", standalone)
-    else
-        -- Slave模式
-        launcher.launch("cslave", harbor, master, address)
-    end
-    launcher.launch("harbor", harbor, address)
-end
+-- 分布式（harbor>0）：按需启动 cmaster（standalone=true 时），启动 cslave 并命名 .cslave
+if standalone then pcall(skynet.newservice,"cmaster") end
+local ok, slave = pcall(skynet.newservice, "cslave")
+skynet.name(".cslave", slave)
+```
+
+`harbor` C 服务由 `cslave`/`cdummy` 内部启动：
+
+```lua
+-- 内部启动 harbor（service/cslave.lua:242, service/cdummy.lua:37）
+harbor_service = assert(skynet.launch("harbor", harbor_id, skynet.self()))
 ```
 
 ### 7.2 多节点部署方案
@@ -752,135 +720,40 @@ master = "192.168.1.10:2013"
 
 ### 8.1 跨节点通信优化
 
-**消息合并**：
-```c
-// 小消息合并发送
-struct message_batch {
-    int count;
-    struct harbor_msg messages[MAX_BATCH_SIZE];
-    size_t total_size;
-};
+Harbor 层未实现批量写出/压缩等复杂优化，实际优化策略建议：
 
-static void batch_send(struct harbor *h, int harbor_id) {
-    struct slave *s = &h->s[harbor_id];
-    struct message_batch batch = {0};
-    
-    // 收集小消息
-    while (batch.count < MAX_BATCH_SIZE && 
-           batch.total_size < MAX_BATCH_BYTES) {
-        struct harbor_msg *m = peek_queue(s->queue);
-        if (!m || m->size > MAX_BATCH_BYTES - batch.total_size)
-            break;
-            
-        batch.messages[batch.count++] = *pop_queue(s->queue);
-        batch.total_size += m->size;
+- 应用层合并：在 Lua 层将多条小消息封包为一次 `PTYPE_LUA` 发送，由接收方解包处理。
+- 队列削峰：利用 Harbor 的待发队列与 `SKYNET_SOCKET_TYPE_WARNING` 告警配合限流（见 8.2）。
+- 大消息规避：对超大包（>16MB）拆分为多条业务消息，避免触发 Harbor 的长度检查与断连（接收侧高字节必须为 0）。
+
+### 8.2 队列发送与流控
+
+Harbor 通过队列缓存与逐条发送实现简单有效的流控；当连接拥塞时，Socket 层会回送 `SKYNET_SOCKET_TYPE_WARNING` 告警：
+
+```c
+// 发送待发队列（service-src/service_harbor.c:400）
+static void
+dispatch_queue(struct harbor *h, int id) {
+    struct slave *s = &h->s[id];
+    int fd = s->fd;
+    assert(fd != 0);
+    struct harbor_msg_queue *queue = s->queue;
+    if (queue == NULL) return;
+    struct harbor_msg * m;
+    while ((m = pop_queue(queue)) != NULL) {
+        send_remote(h->ctx, fd, m->buffer, m->size, &m->header);
+        skynet_free(m->buffer);
     }
-    
-    // 批量发送
-    if (batch.count > 0) {
-        send_batch_messages(s->fd, &batch);
-    }
+    release_queue(queue);
+    s->queue = NULL;
 }
-```
 
-**消息压缩**（可选）：
-```c
-// 对大消息进行压缩
-static int send_compressed(int fd, void *data, size_t size) {
-    if (size > COMPRESS_THRESHOLD) {
-        size_t compressed_size;
-        void *compressed = compress(data, size, &compressed_size);
-        if (compressed_size < size * 0.8) {
-            // 压缩有效，发送压缩数据
-            send_with_flag(fd, compressed, compressed_size, FLAG_COMPRESSED);
-            free(compressed);
-            return 1;
-        }
-        free(compressed);
-    }
-    // 不压缩，直接发送
-    send_with_flag(fd, data, size, FLAG_RAW);
-    return 0;
-}
-```
-
-### 8.2 批量消息传输
-
-```c
-// 批量传输实现
-#define MAX_IOV 16
-
-static void flush_send_queue(struct harbor *h, int harbor_id) {
-    struct slave *s = &h->s[harbor_id];
-    struct iovec iov[MAX_IOV];
-    int iov_count = 0;
-    size_t total_size = 0;
-    
-    // 准备批量数据
-    struct harbor_msg *m;
-    while ((m = pop_queue(s->queue)) != NULL && iov_count < MAX_IOV-2) {
-        // 添加长度头
-        uint32_t sz = m->size + sizeof(m->header);
-        iov[iov_count].iov_base = &sz;
-        iov[iov_count].iov_len = 4;
-        iov_count++;
-        
-        // 添加消息
-        iov[iov_count].iov_base = m;
-        iov[iov_count].iov_len = sz;
-        iov_count++;
-        
-        total_size += sz + 4;
-        
-        if (total_size > MAX_SEND_BUFFER)
-            break;
-    }
-    
-    // 批量发送
-    if (iov_count > 0) {
-        socket_writev(s->fd, iov, iov_count);
-    }
-}
-```
-
-### 8.3 连接池管理
-
-```c
-// 连接池实现
-struct connection_pool {
-    struct connection {
-        int fd;
-        int harbor_id;
-        int ref_count;
-        time_t last_active;
-    } conns[MAX_CONNECTIONS];
-    int count;
-};
-
-// 获取或创建连接
-static int get_connection(struct connection_pool *pool, int harbor_id) {
-    // 查找现有连接
-    for (int i = 0; i < pool->count; i++) {
-        if (pool->conns[i].harbor_id == harbor_id) {
-            pool->conns[i].ref_count++;
-            pool->conns[i].last_active = time(NULL);
-            return pool->conns[i].fd;
-        }
-    }
-    
-    // 创建新连接
-    if (pool->count < MAX_CONNECTIONS) {
-        int fd = create_connection(harbor_id);
-        pool->conns[pool->count].fd = fd;
-        pool->conns[pool->count].harbor_id = harbor_id;
-        pool->conns[pool->count].ref_count = 1;
-        pool->conns[pool->count].last_active = time(NULL);
-        pool->count++;
-        return fd;
-    }
-    
-    // 连接池满，复用最久未使用的
-    return reuse_oldest_connection(pool, harbor_id);
+// 拥塞告警（service-src/service_harbor.c:720）
+case SKYNET_SOCKET_TYPE_WARNING: {
+    int id = harbor_id(h, message->id);
+    if (id) skynet_error(context,
+        "message havn't send to Harbor (%d) reach %d K", id, message->ud);
+    break;
 }
 ```
 

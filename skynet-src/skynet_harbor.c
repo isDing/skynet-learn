@@ -19,27 +19,30 @@ invalid_type(int type) {
 void 
 skynet_harbor_send(struct remote_message *rmsg, uint32_t source, int session) {
 	assert(invalid_type(rmsg->type) && REMOTE);
+    // 将消息发送给Harbor服务处理
 	skynet_context_send(REMOTE, rmsg, sizeof(*rmsg) , source, PTYPE_SYSTEM , session);
 }
 
 int 
 skynet_harbor_message_isremote(uint32_t handle) {
 	assert(HARBOR != ~0);
-	int h = (handle & ~HANDLE_MASK);
-	return h != HARBOR && h !=0;
+	int h = (handle & ~HANDLE_MASK);  // 提取高8位
+	return h != HARBOR && h !=0;      // 非本地且非单节点模式
 }
 
 void
 skynet_harbor_init(int harbor) {
+    // 设置本地Harbor ID（左移24位存储在高8位）
 	HARBOR = (unsigned int)harbor << HANDLE_REMOTE_SHIFT;
 }
 
 void
 skynet_harbor_start(void *ctx) {
+    // 保留Harbor服务的引用，确保不被释放
 	// the HARBOR must be reserved to ensure the pointer is valid.
 	// It will be released at last by calling skynet_harbor_exit
 	skynet_context_reserve(ctx);
-	REMOTE = ctx;
+	REMOTE = ctx;  // 保存Harbor服务上下文
 }
 
 void

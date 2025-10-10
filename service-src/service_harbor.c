@@ -32,15 +32,15 @@
 	harbor id (8bits) is also in that place , but remote message doesn't need harbor id.
  */
 struct remote_message_header {
-	uint32_t source;
-	uint32_t destination;
-	uint32_t session;
+	uint32_t source;       // 源服务句柄
+	uint32_t destination;  // 目标服务句柄（高8位含消息类型）
+	uint32_t session;      // 会话ID
 };
 
 struct harbor_msg {
 	struct remote_message_header header;
-	void * buffer;
-	size_t size;
+	void * buffer;         // 消息内容
+	size_t size;           // 消息大小
 };
 
 struct harbor_msg_queue {
@@ -52,38 +52,41 @@ struct harbor_msg_queue {
 
 struct keyvalue {
 	struct keyvalue * next;
-	char key[GLOBALNAME_LENGTH];
-	uint32_t hash;
-	uint32_t value;
-	struct harbor_msg_queue * queue;
+	char key[GLOBALNAME_LENGTH];       // 16字节名字
+	uint32_t hash;                     // 名字哈希值
+	uint32_t value;                    // 服务句柄
+	struct harbor_msg_queue * queue;   // 待处理消息队列
 };
 
 struct hashmap {
 	struct keyvalue *node[HASH_SIZE];
 };
 
-#define STATUS_WAIT 0
-#define STATUS_HANDSHAKE 1
-#define STATUS_HEADER 2
-#define STATUS_CONTENT 3
-#define STATUS_DOWN 4
+// Slave节点状态
+#define STATUS_WAIT 0		// 等待连接
+#define STATUS_HANDSHAKE 1	// 握手中
+#define STATUS_HEADER 2		// 读取消息头
+#define STATUS_CONTENT 3	// 读取消息体
+#define STATUS_DOWN 4		// 连接断开
 
+// Slave连接信息
 struct slave {
-	int fd;
-	struct harbor_msg_queue *queue;
-	int status;
-	int length;
-	int read;
-	uint8_t size[4];
-	char * recv_buffer;
+	int fd;                           // Socket文件描述符
+	struct harbor_msg_queue *queue;   // 消息队列
+	int status;                        // 连接状态
+	int length;                        // 当前消息长度
+	int read;                          // 已读取字节数
+	uint8_t size[4];                   // 消息长度缓冲
+	char * recv_buffer;                // 接收缓冲区
 };
 
+// Harbor主结构
 struct harbor {
-	struct skynet_context *ctx;
-	int id;
-	uint32_t slave;
-	struct hashmap * map;
-	struct slave s[REMOTE_MAX];
+	struct skynet_context *ctx;       // 关联的Skynet上下文
+	int id;                           // 本节点Harbor ID
+	uint32_t slave;                   // Slave服务句柄
+	struct hashmap * map;             // 全局名字表
+	struct slave s[REMOTE_MAX];       // 所有远程节点连接（最多256个）
 };
 
 // hash table
@@ -309,6 +312,7 @@ message_to_header(const uint32_t *message, struct remote_message_header *header)
 
 // socket package
 
+// 将远程消息转发为本地消息
 static void
 forward_local_messsage(struct harbor *h, void *msg, int sz) {
 	const char * cookie = msg;
@@ -320,6 +324,7 @@ forward_local_messsage(struct harbor *h, void *msg, int sz) {
 	int type = destination >> HANDLE_REMOTE_SHIFT;
 	destination = (destination & HANDLE_MASK) | ((uint32_t)h->id << HANDLE_REMOTE_SHIFT);
 
+    // 直接将 payload 作为消息体（不复制），交给本地服务
 	if (skynet_send(h->ctx, header.source, destination, type | PTYPE_TAG_DONTCOPY , (int)header.session, (void *)msg, sz-HEADER_COOKIE_LENGTH) < 0) {
 		if (type != PTYPE_ERROR) {
 			// don't need report error when type is error
@@ -329,6 +334,7 @@ forward_local_messsage(struct harbor *h, void *msg, int sz) {
 	}
 }
 
+// 发送远程消息
 static void
 send_remote(struct skynet_context * ctx, int fd, const char * buffer, size_t sz, struct remote_message_header * cookie) {
 	size_t sz_header = sz+sizeof(*cookie);
@@ -396,6 +402,7 @@ dispatch_name_queue(struct harbor *h, struct keyvalue * node) {
 	}
 }
 
+// 发送待发队列
 static void
 dispatch_queue(struct harbor *h, int id) {
 	struct slave *s = &h->s[id];
@@ -523,11 +530,13 @@ update_name(struct harbor *h, const char name[GLOBALNAME_LENGTH], uint32_t handl
 	}
 }
 
+// 句柄路由
 static int
 remote_send_handle(struct harbor *h, uint32_t source, uint32_t destination, int type, int session, const char * msg, size_t sz) {
 	int harbor_id = destination >> HANDLE_REMOTE_SHIFT;
 	struct skynet_context * context = h->ctx;
 	if (harbor_id == h->id) {
+        // 本地消息：直接投递，且使用 PTYPE_TAG_DONTCOPY 避免多余拷贝
 		// local message
 		skynet_send(context, source, destination , type | PTYPE_TAG_DONTCOPY, session, (void *)msg, sz);
 		return 1;
@@ -536,11 +545,13 @@ remote_send_handle(struct harbor *h, uint32_t source, uint32_t destination, int 
 	struct slave * s = &h->s[harbor_id];
 	if (s->fd == 0 || s->status == STATUS_HANDSHAKE) {
 		if (s->status == STATUS_DOWN) {
+            // 目标不可达：回报 PTYPE_ERROR 并记录
 			// throw an error return to source
 			// report the destination is dead
 			skynet_send(context, destination, source, PTYPE_ERROR, session, NULL, 0);
 			skynet_error(context, "Drop message to harbor %d from %x to %x (session = %d, msgsz = %d)",harbor_id, source, destination,session,(int)sz);
 		} else {
+            // 连接未就绪：入队待发
 			if (s->queue == NULL) {
 				s->queue = new_queue();
 			}
@@ -552,6 +563,7 @@ remote_send_handle(struct harbor *h, uint32_t source, uint32_t destination, int 
 			return 1;
 		}
 	} else {
+        // 连接就绪：立即发送
 		struct remote_message_header cookie;
 		cookie.source = source;
 		cookie.destination = (destination & HANDLE_MASK) | ((uint32_t)type << HANDLE_REMOTE_SHIFT);
@@ -587,6 +599,7 @@ remote_send_name(struct harbor *h, uint32_t source, const char name[GLOBALNAME_L
 	}
 }
 
+// 发送单字节握手 id
 static void
 handshake(struct harbor *h, int id) {
 	struct slave *s = &h->s[id];
@@ -668,6 +681,7 @@ mainloop(struct skynet_context * context, void * ud, int type, int session, uint
 	struct harbor * h = ud;
 	switch (type) {
 	case PTYPE_SOCKET: {
+		// 接收远端
 		const struct skynet_socket_message * message = msg;
 		switch(message->type) {
 		case SKYNET_SOCKET_TYPE_DATA:
@@ -687,6 +701,7 @@ mainloop(struct skynet_context * context, void * ud, int type, int session, uint
 		case SKYNET_SOCKET_TYPE_CONNECT:
 			// fd forward to this service
 			break;
+		// 拥塞告警
 		case SKYNET_SOCKET_TYPE_WARNING: {
 			int id = harbor_id(h, message->id);
 			if (id) {
