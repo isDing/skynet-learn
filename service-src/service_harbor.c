@@ -28,8 +28,9 @@
 #define HEADER_COOKIE_LENGTH 12
 
 /*
-	message type (8bits) is in destination high 8bits
-	harbor id (8bits) is also in that place , but remote message doesn't need harbor id.
+	message type (8bits) is encoded into the high 8 bits of destination.
+	注意：这里不会携带目标 harbor id，具体节点由外层连接上下文决定，
+	接收端在 forward_local_messsage 中再补写本地 harbor id。
  */
 struct remote_message_header {
 	uint32_t source;       // 源服务句柄
@@ -69,7 +70,7 @@ struct hashmap {
 #define STATUS_CONTENT 3	// 读取消息体
 #define STATUS_DOWN 4		// 连接断开
 
-// Slave连接信息
+// Slave连接信息，某个远端节点连接的状态机上下文
 struct slave {
 	int fd;                           // Socket文件描述符
 	struct harbor_msg_queue *queue;   // 消息队列
@@ -80,7 +81,7 @@ struct slave {
 	char * recv_buffer;                // 接收缓冲区
 };
 
-// Harbor主结构
+// Harbor主结构，本服务状态
 struct harbor {
 	struct skynet_context *ctx;       // 关联的Skynet上下文
 	int id;                           // 本节点Harbor ID
@@ -235,6 +236,7 @@ close_harbor(struct harbor *h, int id) {
 	struct slave *s = &h->s[id];
 	s->status = STATUS_DOWN;
 	if (s->fd) {
+		// 仅关闭 fd，通知 Lua 层的 .cslave 由 report_harbor_down 负责补充业务告警
 		skynet_socket_close(h->ctx, s->fd);
 		s->fd = 0;
 	}
@@ -249,6 +251,7 @@ report_harbor_down(struct harbor *h, int id) {
 	char down[64];
 	int n = sprintf(down, "D %d",id);
 
+	// 通过 PTYPE_TEXT 通知 Lua 层 .cslave，触发后续下线处理与重连
 	skynet_send(h->ctx, 0, h->slave, PTYPE_TEXT, 0, down, n);
 }
 
@@ -320,6 +323,7 @@ forward_local_messsage(struct harbor *h, void *msg, int sz) {
 	struct remote_message_header header;
 	message_to_header((const uint32_t *)cookie, &header);
 
+	// 取出消息类型后用本地 harbor id 给句柄补齐高 8 位，恢复完整句柄
 	uint32_t destination = header.destination;
 	int type = destination >> HANDLE_REMOTE_SHIFT;
 	destination = (destination & HANDLE_MASK) | ((uint32_t)h->id << HANDLE_REMOTE_SHIFT);
@@ -342,6 +346,8 @@ send_remote(struct skynet_context * ctx, int fd, const char * buffer, size_t sz,
 		skynet_error(ctx, "remote message from :%08x to :%08x is too large.", cookie->source, cookie->destination);
 		return;
 	}
+	// REMOTE 报文格式：
+	// [4字节长度(大端)][消息体payload][12字节remote_message_header]
 	uint8_t sendbuf[sz_header+4];
 	to_bigendian(sendbuf, (uint32_t)sz_header);
 	memcpy(sendbuf+4, buffer, sz);
@@ -386,6 +392,7 @@ dispatch_name_queue(struct harbor *h, struct keyvalue * node) {
 				struct harbor_msg * m;
 				while ((m = pop_queue(s->queue)) != NULL) {
 					int type = m->header.destination >> HANDLE_REMOTE_SHIFT;
+					// 目标就在本节点，直接走本地 fast path，避免数据重新拼包
 					skynet_send(context, m->header.source, handle , type | PTYPE_TAG_DONTCOPY, m->header.session, m->buffer, m->size);
 				}
 				release_queue(s->queue);
@@ -455,8 +462,10 @@ push_socket_data(struct harbor *h, const struct skynet_socket_message * message)
 			}
 			++buffer;
 			--size;
+			// 握手确认后切换到读取长度阶段
 			s->status = STATUS_HEADER;
 
+			// 握手结束后尝试派发此前积压的消息
 			dispatch_queue(h, id);
 
 			if (size == 0) {
@@ -481,6 +490,7 @@ push_socket_data(struct harbor *h, const struct skynet_socket_message * message)
 					close_harbor(h,id);
 					return;
 				}
+				// 长度字段是大端 24 bits ，最高位固定为 0 ，意味着单包最大 16MB
 				s->length = s->size[1] << 16 | s->size[2] << 8 | s->size[3];
 				s->read = 0;
 				s->recv_buffer = skynet_malloc(s->length);
@@ -557,6 +567,7 @@ remote_send_handle(struct harbor *h, uint32_t source, uint32_t destination, int 
 			}
 			struct remote_message_header header;
 			header.source = source;
+			// 高 8 位存消息类型，低 24 位保留对端本地句柄，等待接收端补齐 harbor id
 			header.destination = (type << HANDLE_REMOTE_SHIFT) | (destination & HANDLE_MASK);
 			header.session = (uint32_t)session;
 			push_queue(s->queue, (void *)msg, sz, &header);
@@ -566,6 +577,7 @@ remote_send_handle(struct harbor *h, uint32_t source, uint32_t destination, int 
         // 连接就绪：立即发送
 		struct remote_message_header cookie;
 		cookie.source = source;
+		// 将消息类型编码到高位，保持与排队时的格式一致
 		cookie.destination = (destination & HANDLE_MASK) | ((uint32_t)type << HANDLE_REMOTE_SHIFT);
 		cookie.session = (uint32_t)session;
 		send_remote(context, s->fd, msg,sz,&cookie);
@@ -589,6 +601,7 @@ remote_send_name(struct harbor *h, uint32_t source, const char name[GLOBALNAME_L
 		header.destination = type << HANDLE_REMOTE_SHIFT;
 		header.session = (uint32_t)session;
 		push_queue(node->queue, (void *)msg, sz, &header);
+		// 名字未知：向 .cslave 发送 Q 命令，请求 Master 查询
 		char query[2+GLOBALNAME_LENGTH+1] = "Q ";
 		query[2+GLOBALNAME_LENGTH] = 0;
 		memcpy(query+2, name, GLOBALNAME_LENGTH);
@@ -618,7 +631,7 @@ harbor_command(struct harbor * h, const char * msg, size_t sz, int session, uint
 	int s = (int)sz;
 	s -= 2;
 	switch(msg[0]) {
-	case 'N' : {
+	case 'N' : {	// 更新名字
 		if (s <=0 || s>= GLOBALNAME_LENGTH) {
 			skynet_error(h->ctx, "Invalid global name %s", name);
 			return;
@@ -630,8 +643,8 @@ harbor_command(struct harbor * h, const char * msg, size_t sz, int session, uint
 		update_name(h, rn.name, rn.handle);
 		break;
 	}
-	case 'S' :
-	case 'A' : {
+	case 'S' :		// 主动连接
+	case 'A' : {	// 被动连接
 		char buffer[s+1];
 		memcpy(buffer, name, s);
 		buffer[s] = 0;
@@ -648,12 +661,14 @@ harbor_command(struct harbor * h, const char * msg, size_t sz, int session, uint
 		}
 		slave->fd = fd;
 
+		// 将 fd 纳入 socket 事件循环并发出本节点 harbor id 完成双向握手
 		skynet_socket_start(h->ctx, fd);
 		handshake(h, id);
 		if (msg[0] == 'S') {
 			slave->status = STATUS_HANDSHAKE;
 		} else {
 			slave->status = STATUS_HEADER;
+			// 被动 accept 的连接已经拿到对方 ID，可直接派发排队消息
 			dispatch_queue(h,id);
 		}
 		break;
@@ -716,10 +731,12 @@ mainloop(struct skynet_context * context, void * ud, int type, int session, uint
 		return 0;
 	}
 	case PTYPE_HARBOR: {
+		// 来自 Lua 层 .cslave 的控制命令（N/S/A）
 		harbor_command(h, msg,sz,session,source);
 		return 0;
 	}
 	case PTYPE_SYSTEM : {
+		// 发送至远端
 		// remote message out
 		const struct remote_message *rmsg = msg;
 		if (rmsg->destination.handle == 0) {
@@ -750,6 +767,7 @@ harbor_init(struct harbor *h, struct skynet_context *ctx, const char * args) {
 	uint32_t slave = 0;
 	sscanf(args,"%d %u", &harbor_id, &slave);
 	if (slave == 0) {
+		// Lua 层必须传入 .cslave 句柄，否则直接报错终止
 		return 1;
 	}
 	h->id = harbor_id;
@@ -757,6 +775,7 @@ harbor_init(struct harbor *h, struct skynet_context *ctx, const char * args) {
 	if (harbor_id == 0) {
 		close_all_remotes(h);
 	}
+	// 注册消息派发回调，并启动 socket 子系统轮询
 	skynet_callback(ctx, h, mainloop);
 	skynet_harbor_start(ctx);
 

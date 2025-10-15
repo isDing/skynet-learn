@@ -141,9 +141,10 @@ skynet.start(function()
 	skynet.error("master listen socket " .. tostring(master_addr))
 	local fd = socket.listen(master_addr)
 	-- 接受来自各个 slave 的连接：完成握手并 fork 监控协程
-	socket.start(fd , function(id, addr)
+	socket.start(fd , function(id, addr)	-- 注册 accept 回调并开始接收 ACCEPT 事件
 		skynet.error("connect from " .. addr .. " " .. id)
-		socket.start(id)
+		socket.start(id)	-- 启动该连接 fd 的事件投递并建立其 Lua 侧对象与缓冲区
+		-- 调用 handshake 进行握手，用 pcall 捕获异常，避免异常传播导致 Master 崩溃
 		local ok, slave, slave_addr = pcall(handshake, id)
 		if ok then
 			skynet.fork(monitor_slave, slave, slave_addr)

@@ -13,3 +13,4 @@
 .vscode
 *.swp
 .spec-workflow
+codex-*.sh
