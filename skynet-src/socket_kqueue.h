@@ -10,6 +10,11 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+/*
+ * 说明：
+ *   kqueue 版本的事件抽象，实现接口与 epoll 版本完全一致。
+ *   通过 EVFILT_READ / EVFILT_WRITE 与 enable/disable 来模拟 epoll 的行为。
+ */
 static bool 
 sp_invalid(int kfd) {
 	return kfd == -1;
@@ -29,7 +34,7 @@ sp_release(int kfd) {
 static void 
 sp_del(int kfd, int sock) {
 	struct kevent ke;
-	EV_SET(&ke, sock, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+	EV_SET(&ke, sock, EVFILT_READ, EV_DELETE, 0, 0, NULL);	// 逐个删除读/写过滤器
 	kevent(kfd, &ke, 1, NULL, 0, NULL);
 	EV_SET(&ke, sock, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
 	kevent(kfd, &ke, 1, NULL, 0, NULL);
@@ -78,7 +83,7 @@ sp_wait(int kfd, struct event *e, int max) {
 
 	int i;
 	for (i=0;i<n;i++) {
-		e[i].s = ev[i].udata;
+		e[i].s = ev[i].udata;		// udata 事先绑定了 socket 对象
 		unsigned filter = ev[i].filter;
 		bool eof = (ev[i].flags & EV_EOF) != 0;
 		e[i].write = (filter == EVFILT_WRITE) && (!eof);

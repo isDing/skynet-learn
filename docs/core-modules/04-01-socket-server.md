@@ -31,11 +31,11 @@ OS网络接口 (epoll/kqueue)
 
 ### 1.2 核心职责
 
-- **跨平台网络I/O**：统一封装 epoll、kqueue、poll
-- **Socket生命周期管理**：创建、连接、读写、关闭
-- **事件驱动**：基于事件循环处理网络事件
-- **缓冲区管理**：高效的读写缓冲区
-- **协议支持**：TCP、UDP、Unix Domain Socket
+- **跨平台网络I/O**：统一封装 Linux 的 epoll 与 BSD/macOS 的 kqueue（控制管道轮询使用 select）
+- **Socket 生命周期管理**：创建、连接、监听、接收、关闭
+- **事件驱动**：基于非阻塞 I/O 的事件循环调度
+- **缓冲区管理**：优先级写队列与自适应读缓冲
+- **协议支持**：TCP、UDP（同时覆盖 IPv4/IPv6）
 
 ### 1.3 设计目标
 
@@ -59,6 +59,8 @@ OS网络接口 (epoll/kqueue)
 #define MAX_EVENT 64                    // 单次处理最大事件数
 #define MIN_READ_BUFFER 64              // 最小读缓冲区
 #define WARNING_SIZE (1024*1024)        // 写缓冲区警告阈值：1MB
+#define UDP_ADDRESS_SIZE 19             // UDP 地址序列化长度
+#define MAX_UDP_PACKAGE 65535           // UDP 单包最大长度
 
 // Socket类型定义
 #define SOCKET_TYPE_INVALID 0           // 无效
@@ -76,6 +78,14 @@ OS网络接口 (epoll/kqueue)
 #define PROTOCOL_TCP 0                  // TCP协议
 #define PROTOCOL_UDP 1                  // IPv4 UDP
 #define PROTOCOL_UDPv6 2                // IPv6 UDP
+#define PROTOCOL_UNKNOWN 255            // 初始占位
+
+// 写缓冲优先级
+#define PRIORITY_HIGH 0
+#define PRIORITY_LOW 1
+
+// 用户对象标记（配合 socket_object_interface 使用）
+#define USEROBJECT ((size_t)(-1))
 ```
 
 ## 2. 核心数据结构
@@ -84,90 +94,73 @@ OS网络接口 (epoll/kqueue)
 
 ```c
 struct socket {
-    // 基本属性
-    uintptr_t opaque;              // 拥有此socket的服务句柄（回调时使用）
+    uintptr_t opaque;              // 拥有此 socket 的服务句柄
+    struct wb_list high;           // 高优先级写缓冲
+    struct wb_list low;            // 低优先级写缓冲
+    int64_t wb_size;               // 写缓冲累计字节
+    struct socket_stat stat;       // 读写统计
+    ATOM_ULONG sending;            // 发送引用计数（高 16 位存储 ID tag）
     int fd;                        // 系统文件描述符
-    int id;                        // Skynet内部socket ID（唯一标识）
-    ATOM_INT type;                 // Socket状态类型（原子变量）
-    uint8_t protocol;              // 协议类型（TCP/UDP）
-    
-    // 写缓冲区（双优先级队列）
-    struct wb_list high;           // 高优先级写缓冲区链表
-    struct wb_list low;            // 低优先级写缓冲区链表
-    int64_t wb_size;               // 写缓冲区总大小
-    int64_t warn_size;             // 写缓冲区警告阈值
-    
-    // 状态标志
-    bool reading;                  // 是否启用读事件监听
-    bool writing;                  // 是否启用写事件监听
-    bool closing;                  // 是否正在关闭
-    ATOM_ULONG sending;            // 正在发送标志（防止并发）
-    ATOM_INT udpconnecting;        // UDP连接计数
-    
-    // 统计信息
-    struct socket_stat stat;       // 读写字节数和时间统计
-    
-    // 协议相关数据
+    int id;                        // Skynet 内部 socket ID
+    ATOM_INT type;                 // Socket 状态
+    uint8_t protocol;              // 协议类型（含 PROTOCOL_UNKNOWN）
+    bool reading;                  // 是否监听读事件
+    bool writing;                  // 是否监听写事件
+    bool closing;                  // 是否处于关闭流程
+    ATOM_INT udpconnecting;        // UDP “连接” 计数（用于 dial）
+    int64_t warn_size;             // 动态写缓冲告警阈值
     union {
-        int size;                  // TCP：下次期望读取的大小
-        uint8_t udp_address[19];   // UDP：目标地址
+        int size;                  // TCP：下一次读取的缓冲大小
+        uint8_t udp_address[UDP_ADDRESS_SIZE]; // UDP：默认目的地址
     } p;
-    
-    // 直写优化（Direct Write）
-    struct spinlock dw_lock;       // 直写锁
-    int dw_offset;                 // 直写偏移量
-    const void * dw_buffer;        // 直写缓冲区
-    size_t dw_size;                // 直写大小
+    struct spinlock dw_lock;       // 直写自旋锁
+    int dw_offset;                 // 直写偏移
+    const void * dw_buffer;        // 直写缓冲指针
+    size_t dw_size;                // 直写总长度
 };
 ```
 
 #### Socket ID 设计
 
 ```c
-// Socket ID = (tag << 16) | slot_index
-// - slot_index: 在socket池中的槽位索引（0-65535）
-// - tag: 版本号，防止ID重用导致的混乱
+// reserve_id 会将 alloc_id 原子 +1，id 递增
+int id = ATOM_FINC(&ss->alloc_id) + 1;
+if (id < 0) {
+    id = ATOM_FAND(&ss->alloc_id, 0x7fffffff) & 0x7fffffff;
+}
 
-#define HASH_ID(id) (((unsigned)id) % MAX_SOCKET)  // 获取槽位索引
-#define ID_TAG16(id) ((id>>MAX_SOCKET_P) & 0xffff) // 获取版本号
+// 使用 HASH_ID(id) 映射到 slot（取模 65536）
+struct socket *s = &ss->slot[HASH_ID(id)];
 
-// ID分配示例
-int alloc_id = ATOM_FINC(&ss->alloc_id);
-int id = (alloc_id << MAX_SOCKET_P) | slot_index;
+// 如果槽位空闲，CAS 将状态从 INVALID 置为 RESERVE，并记录 id
+if (ATOM_CAS(&s->type, SOCKET_TYPE_INVALID, SOCKET_TYPE_RESERVE)) {
+    s->id = id;
+    s->protocol = PROTOCOL_UNKNOWN;
+    ATOM_INIT(&s->udpconnecting, 0);
+    s->fd = -1;
+    return id;
+}
 ```
 
 ### 2.2 struct socket_server - 全局管理器
 
 ```c
 struct socket_server {
-    // 时间管理
-    volatile uint64_t time;        // 当前时间戳（centisecond，百分之一秒）
-    
-    // 控制管道（用于异步命令）
+    volatile uint64_t time;        // 时间戳（centisecond）
+    int reserve_fd;                // EMFILE 保护 fd
     int recvctrl_fd;               // 控制管道读端
     int sendctrl_fd;               // 控制管道写端
-    int checkctrl;                 // 是否检查控制命令
-    
-    // 事件机制
-    poll_fd event_fd;              // epoll/kqueue 文件描述符
-    int event_n;                   // 当前事件数量
-    int event_index;               // 当前处理到的事件索引
-    struct event ev[MAX_EVENT];    // 事件数组（一次最多64个）
-    
-    // Socket池
-    struct socket slot[MAX_SOCKET]; // Socket数组（65536个槽位）
-    ATOM_INT alloc_id;             // ID分配计数器
-    
-    // 缓冲区
-    char buffer[MAX_INFO];         // 信息缓冲区（128字节）
-    uint8_t udpbuffer[MAX_UDP_PACKAGE]; // UDP数据包缓冲区（64KB）
-    
-    // 接口回调
-    struct socket_object_interface soi; // 内存管理回调
-    
-    // 资源预留
-    int reserve_fd;                // 预留fd，用于EMFILE错误恢复
-    fd_set rfds;                   // select用的fd集合
+    int checkctrl;                 // 是否需要检查控制命令
+    poll_fd event_fd;              // epoll/kqueue 句柄
+    ATOM_INT alloc_id;             // Socket ID 分配器
+    int event_n;                   // 本轮事件总数
+    int event_index;               // 当前处理位置
+    struct socket_object_interface soi; // 用户对象回调
+    struct event ev[MAX_EVENT];    // 事件数组
+    struct socket slot[MAX_SOCKET]; // socket 槽位
+    char buffer[MAX_INFO];         // 临时字符串缓冲
+    uint8_t udpbuffer[MAX_UDP_PACKAGE]; // UDP recvfrom 缓冲
+    fd_set rfds;                   // select 检测控制管道
 };
 ```
 
@@ -243,63 +236,78 @@ Skynet 通过条件编译支持多个平台的事件机制：
 
 ```c
 // socket_poll.h
-#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined (__NetBSD__)
-    #include "socket_kqueue.h"      // BSD系统使用kqueue
-#elif defined(__linux__)
-    #include "socket_epoll.h"       // Linux使用epoll
-#else
-    #include "socket_select.h"      // 其他系统使用select
+typedef int poll_fd;
+
+struct event {
+    void * s;
+    bool read;
+    bool write;
+    bool error;
+    bool eof;
+};
+
+static bool sp_invalid(poll_fd fd);
+static poll_fd sp_create(void);
+static void sp_release(poll_fd fd);
+static int sp_add(poll_fd fd, int sock, void *ud);
+static void sp_del(poll_fd fd, int sock);
+static int sp_enable(poll_fd fd, int sock, void *ud, bool read_enable, bool write_enable);
+static int sp_wait(poll_fd fd, struct event *e, int max);
+static void sp_nonblocking(int sock);
+
+#ifdef __linux__
+#include "socket_epoll.h"
 #endif
 
-// 统一的接口函数
-static bool sp_create(poll_fd *efd);
-static void sp_release(poll_fd efd);
-static int sp_add(poll_fd efd, int sock, void *ud);
-static void sp_del(poll_fd efd, int sock);
-static int sp_enable(poll_fd efd, int sock, void *ud, bool read_enable, bool write_enable);
-static int sp_wait(poll_fd efd, struct event *e, int max);
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined (__NetBSD__)
+#include "socket_kqueue.h"
+#endif
 ```
 
 ### 3.2 epoll 实现（Linux）
 
 ```c
-// socket_epoll.h 核心实现
+// socket_epoll.h 核心实现（摘录）
 #include <sys/epoll.h>
 
-typedef int poll_fd;
-
-struct event {
-    void * s;        // socket指针
-    bool read;       // 可读事件
-    bool write;      // 可写事件
-    bool error;      // 错误事件
-    bool eof;        // EOF事件
-};
-
 static bool 
-sp_create(poll_fd *efd) {
-    *efd = epoll_create(1024);
-    return *efd != -1;
+sp_invalid(int efd) {
+    return efd == -1;
+}
+
+static poll_fd
+sp_create(void) {
+    return epoll_create(1024);
+}
+
+static void
+sp_release(int efd) {
+    close(efd);
 }
 
 static int
-sp_add(poll_fd efd, int sock, void *ud) {
+sp_add(int efd, int sock, void *ud) {
     struct epoll_event ev;
-    ev.events = EPOLLIN;  // 默认监听可读
-    ev.data.ptr = ud;     // 关联socket对象
-    return epoll_ctl(efd, EPOLL_CTL_ADD, sock, &ev);
+    ev.events = EPOLLIN;
+    ev.data.ptr = ud;
+    return epoll_ctl(efd, EPOLL_CTL_ADD, sock, &ev) == -1 ? 1 : 0;
+}
+
+static void
+sp_del(int efd, int sock) {
+    epoll_ctl(efd, EPOLL_CTL_DEL, sock, NULL);
 }
 
 static int
-sp_enable(poll_fd efd, int sock, void *ud, bool read_enable, bool write_enable) {
+sp_enable(int efd, int sock, void *ud, bool read_enable, bool write_enable) {
     struct epoll_event ev;
     ev.events = (read_enable ? EPOLLIN : 0) | (write_enable ? EPOLLOUT : 0);
     ev.data.ptr = ud;
-    return epoll_ctl(efd, EPOLL_CTL_MOD, sock, &ev);
+    return epoll_ctl(efd, EPOLL_CTL_MOD, sock, &ev) == -1 ? 1 : 0;
 }
 
 static int
-sp_wait(poll_fd efd, struct event *e, int max) {
+sp_wait(int efd, struct event *e, int max) {
     struct epoll_event ev[max];
     int n = epoll_wait(efd, ev, max, -1);
     
@@ -307,12 +315,20 @@ sp_wait(poll_fd efd, struct event *e, int max) {
         e[i].s = ev[i].data.ptr;
         unsigned flag = ev[i].events;
         e[i].write = (flag & EPOLLOUT) != 0;
-        e[i].read = (flag & (EPOLLIN | EPOLLHUP)) != 0;
+        e[i].read  = (flag & EPOLLIN)  != 0;
         e[i].error = (flag & EPOLLERR) != 0;
-        e[i].eof = false;
+        e[i].eof   = (flag & EPOLLHUP) != 0;
     }
     
     return n;
+}
+
+static void
+sp_nonblocking(int fd) {
+    int flag = fcntl(fd, F_GETFL, 0);
+    if (flag >= 0) {
+        fcntl(fd, F_SETFL, flag | O_NONBLOCK);
+    }
 }
 ```
 
@@ -361,64 +377,93 @@ Skynet 使用**水平触发（LT）**模式：
 ### 3.3 kqueue 实现（BSD/macOS）
 
 ```c
-// socket_kqueue.h 核心实现
+// socket_kqueue.h 核心实现（摘录）
 #include <sys/event.h>
 
-typedef int poll_fd;
-
 static bool 
-sp_create(poll_fd *kfd) {
-    *kfd = kqueue();
-    return *kfd != -1;
+sp_invalid(int kfd) {
+    return kfd == -1;
 }
 
-static int
-sp_add(poll_fd kfd, int sock, void *ud) {
+static poll_fd
+sp_create(void) {
+    return kqueue();
+}
+
+static void
+sp_release(int kfd) {
+    close(kfd);
+}
+
+static void 
+sp_del(int kfd, int sock) {
     struct kevent ke;
-    // 注册可读事件
-    EV_SET(&ke, sock, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, ud);
-    return kevent(kfd, &ke, 1, NULL, 0, NULL);
+    EV_SET(&ke, sock, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+    kevent(kfd, &ke, 1, NULL, 0, NULL);
+    EV_SET(&ke, sock, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+    kevent(kfd, &ke, 1, NULL, 0, NULL);
+}
+
+static int 
+sp_add(int kfd, int sock, void *ud) {
+    struct kevent ke;
+    EV_SET(&ke, sock, EVFILT_READ, EV_ADD, 0, 0, ud);
+    if (kevent(kfd, &ke, 1, NULL, 0, NULL) == -1 || (ke.flags & EV_ERROR)) {
+        return 1;
+    }
+    EV_SET(&ke, sock, EVFILT_WRITE, EV_ADD, 0, 0, ud);
+    if (kevent(kfd, &ke, 1, NULL, 0, NULL) == -1 || (ke.flags & EV_ERROR)) {
+        EV_SET(&ke, sock, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+        kevent(kfd, &ke, 1, NULL, 0, NULL);
+        return 1;
+    }
+    EV_SET(&ke, sock, EVFILT_WRITE, EV_DISABLE, 0, 0, ud);
+    if (kevent(kfd, &ke, 1, NULL, 0, NULL) == -1 || (ke.flags & EV_ERROR)) {
+        sp_del(kfd, sock);
+        return 1;
+    }
+    return 0;
 }
 
 static int
-sp_enable(poll_fd kfd, int sock, void *ud, bool read_enable, bool write_enable) {
-    struct kevent ke[2];
-    int n = 0;
-    
-    // 设置读事件
-    if (read_enable) {
-        EV_SET(&ke[n++], sock, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, ud);
-    } else {
-        EV_SET(&ke[n++], sock, EVFILT_READ, EV_ADD | EV_DISABLE, 0, 0, ud);
+sp_enable(int kfd, int sock, void *ud, bool read_enable, bool write_enable) {
+    int ret = 0;
+    struct kevent ke;
+    EV_SET(&ke, sock, EVFILT_READ, read_enable ? EV_ENABLE : EV_DISABLE, 0, 0, ud);
+    if (kevent(kfd, &ke, 1, NULL, 0, NULL) == -1 || (ke.flags & EV_ERROR)) {
+        ret |= 1;
     }
-    
-    // 设置写事件
-    if (write_enable) {
-        EV_SET(&ke[n++], sock, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, ud);
-    } else {
-        EV_SET(&ke[n++], sock, EVFILT_WRITE, EV_ADD | EV_DISABLE, 0, 0, ud);
+    EV_SET(&ke, sock, EVFILT_WRITE, write_enable ? EV_ENABLE : EV_DISABLE, 0, 0, ud);
+    if (kevent(kfd, &ke, 1, NULL, 0, NULL) == -1 || (ke.flags & EV_ERROR)) {
+        ret |= 1;
     }
-    
-    return kevent(kfd, ke, n, NULL, 0, NULL);
+    return ret;
 }
 
-static int
-sp_wait(poll_fd kfd, struct event *e, int max) {
+static int 
+sp_wait(int kfd, struct event *e, int max) {
     struct kevent ev[max];
     int n = kevent(kfd, NULL, 0, ev, max, NULL);
-    
+
     for (int i=0; i<n; i++) {
-        e[i].s = (void*)ev[i].udata;
+        e[i].s = ev[i].udata;
         unsigned filter = ev[i].filter;
-        unsigned flags = ev[i].flags;
-        
-        e[i].write = (filter == EVFILT_WRITE);
-        e[i].read = (filter == EVFILT_READ);
-        e[i].error = (flags & EV_ERROR) != 0;
-        e[i].eof = (flags & EV_EOF) != 0;
+        bool eof = (ev[i].flags & EV_EOF) != 0;
+        e[i].write = (filter == EVFILT_WRITE) && !eof;
+        e[i].read  = (filter == EVFILT_READ);
+        e[i].error = (ev[i].flags & EV_ERROR) != 0;
+        e[i].eof   = eof;
     }
-    
+
     return n;
+}
+
+static void
+sp_nonblocking(int fd) {
+    int flag = fcntl(fd, F_GETFL, 0);
+    if (flag >= 0) {
+        fcntl(fd, F_SETFL, flag | O_NONBLOCK);
+    }
 }
 ```
 
@@ -426,7 +471,7 @@ sp_wait(poll_fd kfd, struct event *e, int max) {
 
 | 特性 | epoll (Linux) | kqueue (BSD) |
 |------|---------------|--------------|
-| 触发模式 | LT/ET | 边缘触发 |
+| 触发模式 | 水平/边缘（配置可选） | 水平触发（通过 EV_ENABLE/EV_DISABLE 控制） |
 | 事件类型 | 读、写、错误 | 读、写、信号、定时器等 |
 | 性能 | 极高 | 极高 |
 | 接口 | epoll_ctl | kevent |
@@ -441,616 +486,139 @@ sp_wait(poll_fd kfd, struct event *e, int max) {
 ```c
 struct socket_server * 
 socket_server_create(uint64_t time) {
-    struct socket_server *ss = skynet_malloc(sizeof(*ss));
-    
-    // 1. 初始化时间
-    ss->time = time;
-    
-    // 2. 创建事件机制（epoll/kqueue）
-    if (!sp_create(&ss->event_fd)) {
-        skynet_free(ss);
+    poll_fd efd = sp_create();
+    if (sp_invalid(efd)) {
+        skynet_error(NULL, "socket-server error: create event pool failed.");
         return NULL;
     }
-    
-    // 3. 创建控制管道（用于主线程向网络线程发送命令）
+
     int fd[2];
     if (pipe(fd)) {
-        sp_release(ss->event_fd);
-        skynet_free(ss);
+        sp_release(efd);
+        skynet_error(NULL, "socket-server error: create socket pair failed.");
         return NULL;
     }
+    if (sp_add(efd, fd[0], NULL)) {
+        skynet_error(NULL, "socket-server error: can't add server fd to event pool.");
+        close(fd[0]);
+        close(fd[1]);
+        sp_release(efd);
+        return NULL;
+    }
+
+    struct socket_server *ss = MALLOC(sizeof(*ss));
+    ss->time = time;
+    ss->event_fd = efd;
     ss->recvctrl_fd = fd[0];
     ss->sendctrl_fd = fd[1];
     ss->checkctrl = 1;
-    
-    // 4. 将控制管道读端加入事件监听
-    sp_add(ss->event_fd, ss->recvctrl_fd, NULL);
-    
-    // 5. 初始化socket池
+    ss->reserve_fd = dup(1);
+
     for (int i=0; i<MAX_SOCKET; i++) {
         struct socket *s = &ss->slot[i];
         ATOM_INIT(&s->type, SOCKET_TYPE_INVALID);
         clear_wb_list(&s->high);
         clear_wb_list(&s->low);
+        spinlock_init(&s->dw_lock);
     }
-    
-    // 6. 初始化ID分配器
+
     ATOM_INIT(&ss->alloc_id, 0);
-    
-    // 7. 预留一个fd用于EMFILE错误处理
-    ss->reserve_fd = dup(1);
-    
+    ss->event_n = 0;
+    ss->event_index = 0;
+    memset(&ss->soi, 0, sizeof(ss->soi));
+    FD_ZERO(&ss->rfds);
+    assert(ss->recvctrl_fd < FD_SETSIZE);
+
     return ss;
 }
 ```
 
 #### reserve_id - 分配Socket ID
 
-```c
-static int
-reserve_id(struct socket_server *ss) {
-    int i;
-    // 遍历查找空闲slot
-    for (i=0; i<MAX_SOCKET; i++) {
-        int id = ATOM_FINC(&ss->alloc_id);  // 原子递增分配器
-        if (id < 0) {
-            id = ATOM_FAND(&ss->alloc_id, 0x7fffffff);
-        }
-        struct socket *s = &ss->slot[HASH_ID(id)];
-        int type_invalid = SOCKET_TYPE_INVALID;
-        // 尝试CAS设置为RESERVE状态
-        if (ATOM_CAS(&s->type, &type_invalid, SOCKET_TYPE_RESERVE)) {
-            s->id = id;
-            s->protocol = PROTOCOL_TCP;
-            s->fd = -1;
-            s->opaque = 0;
-            s->wb_size = 0;
-            s->warn_size = WARNING_SIZE;
-            s->sending = 0;
-            return id;
-        }
-    }
-    return -1;
-}
-```
+该函数的核心流程已在前文 [Socket ID 设计](#socket-id-设计) 中列出：递增分配 `id`，通过 `HASH_ID` 映射槽位，并使用 CAS 把状态从 `INVALID` 切换到 `RESERVE`。
 
 ### 4.2 TCP连接管理
 
 #### open_socket - 主动连接
 
-```c
-static int
-open_socket(struct socket_server *ss, struct request_open * request, 
-            uintptr_t opaque, char *host, int port) {
-    int id = request->id;
-    struct socket *ns = &ss->slot[HASH_ID(id)];
-    
-    // 1. 验证socket状态
-    assert(ATOM_LOAD(&ns->type) == SOCKET_TYPE_RESERVE);
-    
-    // 2. 创建socket
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        return -1;
-    }
-    
-    // 3. 设置非阻塞
-    sp_nonblocking(sock);
-    
-    // 4. 发起连接
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = inet_addr(host);
-    
-    int status = connect(sock, (struct sockaddr*)&addr, sizeof(addr));
-    
-    if (status != 0 && errno != EINPROGRESS) {
-        close(sock);
-        return -1;
-    }
-    
-    // 5. 初始化socket结构
-    ns->fd = sock;
-    ns->opaque = opaque;
-    ns->reading = true;
-    ns->writing = false;
-    ns->closing = false;
-    
-    // 6. 加入事件监听
-    sp_add(ss->event_fd, sock, ns);
-    
-    // 7. 更新状态
-    if (status == 0) {
-        // 立即连接成功（如连接本地）
-        ATOM_STORE(&ns->type, SOCKET_TYPE_CONNECTED);
-        return SOCKET_OPEN;
-    } else {
-        // 连接中
-        ATOM_STORE(&ns->type, SOCKET_TYPE_CONNECTING);
-        sp_enable(ss->event_fd, sock, ns, true, true);
-        return -1;
-    }
-}
-```
+`open_socket`（`skynet-src/socket_server.c:621`）的关键流程如下：
+
+- 通过 `getaddrinfo` 获取目标地址，依次尝试 `socket` 创建，并启用 `SO_KEEPALIVE` 与非阻塞模式。
+- 调用 `connect`，若立即成功则返回 `SOCKET_OPEN` 并将对端地址写入 `result->data`；若返回 `EINPROGRESS` 则注册写事件并保持 `SOCKET_TYPE_CONNECTING`。
+- 所有失败路径都会关闭临时 fd、释放 `addrinfo`，并将槽位标记回 `SOCKET_TYPE_INVALID`，错误字符串由 `result->data` 返回。
 
 #### listen_socket - 监听端口
 
-```c
-static int
-listen_socket(struct socket_server *ss, struct request_listen *request, 
-              uintptr_t opaque, const char *host, int port, int backlog) {
-    int id = request->id;
-    int listen_fd = request->fd;
-    struct socket *ns = &ss->slot[HASH_ID(id)];
-    
-    // 1. 创建监听socket
-    if (listen_fd < 0) {
-        listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (listen_fd < 0) {
-            return -1;
-        }
-        
-        // 设置SO_REUSEADDR
-        int reuse = 1;
-        setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-        
-        // 绑定地址
-        struct sockaddr_in addr;
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(port);
-        addr.sin_addr.s_addr = host ? inet_addr(host) : INADDR_ANY;
-        
-        if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-            close(listen_fd);
-            return -1;
-        }
-        
-        // 开始监听
-        if (listen(listen_fd, backlog) < 0) {
-            close(listen_fd);
-            return -1;
-        }
-    }
-    
-    // 2. 设置非阻塞
-    sp_nonblocking(listen_fd);
-    
-    // 3. 初始化socket
-    ns->fd = listen_fd;
-    ns->opaque = opaque;
-    ns->reading = true;
-    ns->writing = false;
-    ATOM_STORE(&ns->type, SOCKET_TYPE_LISTEN);
-    
-    // 4. 加入事件监听
-    sp_add(ss->event_fd, listen_fd, ns);
-    
-    return listen_fd;
-}
-```
+`listen_socket`（`skynet-src/socket_server.c:1102`）期望 fd 已绑定并处于监听状态，上层通常通过 `socket_server_listen` 预先完成 `bind`/`listen`。函数内部：
+
+- 调用 `new_fd` 注册到事件循环，初始状态为 `SOCKET_TYPE_PLISTEN`。
+- 通过 `getsockname` 查询实际监听地址，将 IP 字符串写入 `result->data`，将端口写入 `result->ud`，并返回 `SOCKET_OPEN`。
+- 若 `sp_add` 失败或超过 socket 池容量，会关闭 fd、重置槽位，并返回 `SOCKET_ERR`。
 
 #### report_accept - 处理新连接
 
-```c
-static void
-report_accept(struct socket_server *ss, struct socket *s, 
-              struct socket_message *result) {
-    struct socket *ns;
-    int client_fd;
-    struct sockaddr_storage sa;
-    socklen_t salen = sizeof(sa);
-    
-    // 1. accept新连接
-    client_fd = accept(s->fd, (struct sockaddr *)&sa, &salen);
-    if (client_fd < 0) {
-        if (errno == EMFILE || errno == ENFILE) {
-            // 文件描述符耗尽，临时关闭预留fd
-            result->opaque = s->opaque;
-            result->id = s->id;
-            result->ud = 0;
-            result->data = "reach open file limit";
-            return;
-        }
-        return;
-    }
-    
-    // 2. 分配新socket ID
-    int id = reserve_id(ss);
-    if (id < 0) {
-        close(client_fd);
-        return;
-    }
-    
-    // 3. 设置非阻塞
-    sp_nonblocking(client_fd);
-    
-    // 4. 初始化新socket
-    ns = &ss->slot[HASH_ID(id)];
-    ns->fd = client_fd;
-    ns->opaque = s->opaque;
-    ns->reading = true;
-    ns->writing = false;
-    ATOM_STORE(&ns->type, SOCKET_TYPE_CONNECTED);
-    
-    // 5. 加入事件监听
-    sp_add(ss->event_fd, client_fd, ns);
-    
-    // 6. 返回accept结果
-    result->opaque = s->opaque;
-    result->id = id;
-    result->ud = 0;
-    result->data = NULL;
-}
-```
+`report_accept`（`skynet-src/socket_server.c:1668`）在监听 socket 就绪时被调用：
+
+- 调用 `accept` 获取新连接；若返回 `EMFILE/ENFILE`，会利用预留的 `reserve_fd` 执行“临时 accept + 立即关闭”策略，防止监听 fd 饥饿。
+- 成功后申请新的 socket id（`reserve_id`），并通过 `new_fd` 注册，初始类型为 `SOCKET_TYPE_PACCEPT`，随后返回 `SOCKET_ACCEPT`，把客户端地址字符串写入 `result->data`，端口写入 `result->ud`。
+- 若申请 id 或注册失败，则关闭新 fd 并放弃该连接。
 
 ### 4.3 数据收发
 
 #### forward_message_tcp - TCP数据接收
 
-```c
-static int
-forward_message_tcp(struct socket_server *ss, struct socket *s, 
-                    struct socket_message *result) {
-    int sz = s->p.size;  // 期望读取大小
-    char * buffer = skynet_malloc(sz);
-    
-    // 1. 从socket读取数据
-    int n = (int)read(s->fd, buffer, sz);
-    
-    if (n < 0) {
-        // 错误处理
-        skynet_free(buffer);
-        switch (errno) {
-        case AGAIN_WOULDBLOCK:  // 数据未就绪，稍后再试
-            return -1;
-        case EINTR:             // 被中断，继续读
-            return -1;
-        default:                // 其他错误，关闭连接
-            force_close(ss, s, result);
-            return SOCKET_CLOSE;
-        }
-    }
-    
-    if (n == 0) {
-        // 2. 对端关闭连接
-        skynet_free(buffer);
-        force_close(ss, s, result);
-        return SOCKET_CLOSE;
-    }
-    
-    // 3. 调整下次读取大小
-    if (n == sz) {
-        s->p.size *= 2;  // 缓冲区满，下次读更多
-    } else if (sz > MIN_READ_BUFFER && n*2 < sz) {
-        s->p.size /= 2;  // 缓冲区过大，下次读更少
-    }
-    
-    // 4. 返回数据给上层
-    result->opaque = s->opaque;
-    result->id = s->id;
-    result->ud = n;
-    result->data = buffer;
-    
-    // 5. 更新统计
-    s->stat.read += n;
-    s->stat.rtime = ss->time;
-    
-    return SOCKET_DATA;
-}
-```
+`forward_message_tcp`（`skynet-src/socket_server.c:1468`）的处理顺序：
+
+- 以 `s->p.size` 分配读取缓冲；`stat_read` 更新读统计。
+- `read` 返回 <0 时释放缓冲，对于 `EINTR`/`EAGAIN` 直接忽略，其余错误通过 `report_error` 报告 `SOCKET_ERR`。
+- 返回 0 表示对端关闭：若本端仍有待发送数据会等待发送完毕，否则标记半关闭并返回 `SOCKET_CLOSE`（区分 `SOCKET_TYPE_HALFCLOSE_*` 多种情况）。
+- 正常读取时将数据传递给上层，若本次读取填满缓冲返回 `SOCKET_MORE` 并将下一次读缓冲翻倍；若低于一半且大于 `MIN_READ_BUFFER`，则减半以节省内存。
 
 #### send_socket - TCP数据发送
 
-```c
-static int
-send_socket(struct socket_server *ss, struct request_send * request, 
-            struct socket_message *result, int priority, const uint8_t *udp_address) {
-    int id = request->id;
-    struct socket * s = &ss->slot[HASH_ID(id)];
-    
-    // 1. 验证socket状态
-    if (ATOM_LOAD(&s->type) == SOCKET_TYPE_INVALID || 
-        s->id != id || s->closing) {
-        skynet_free((void *)request->buffer);
-        return -1;
-    }
-    
-    // 2. 尝试直接发送（Direct Write优化）
-    if (s->wb_size == 0 && s->sending == 0) {
-        ATOM_FINC(&s->sending);
-        
-        int n = write(s->fd, request->buffer, request->sz);
-        ATOM_FDEC(&s->sending);
-        
-        if (n < 0) {
-            switch (errno) {
-            case AGAIN_WOULDBLOCK:
-                // 缓冲区满，加入队列
-                break;
-            case EINTR:
-                // 被中断，继续
-                break;
-            default:
-                // 发送错误
-                skynet_free((void *)request->buffer);
-                return -1;
-            }
-            n = 0;
-        }
-        
-        // 3. 部分发送成功
-        if (n == request->sz) {
-            // 全部发送完成
-            skynet_free((void *)request->buffer);
-            s->stat.write += n;
-            s->stat.wtime = ss->time;
-            return -1;
-        }
-        
-        // 4. 剩余数据加入写缓冲区
-        request->buffer = (char *)request->buffer + n;
-        request->sz -= n;
-        s->stat.write += n;
-    }
-    
-    // 5. 加入写缓冲区队列
-    struct write_buffer * buf = skynet_malloc(sizeof(*buf));
-    buf->buffer = request->buffer;
-    buf->ptr = (char *)request->buffer;
-    buf->sz = request->sz;
-    buf->userobject = false;
-    buf->next = NULL;
-    
-    if (priority == PRIORITY_HIGH) {
-        append_sendbuffer(&s->high, buf);
-    } else {
-        append_sendbuffer(&s->low, buf);
-    }
-    s->wb_size += request->sz;
-    
-    // 6. 启用写事件
-    if (!s->writing) {
-        s->writing = true;
-        sp_enable(ss->event_fd, s->fd, s, true, true);
-    }
-    
-    // 7. 检查写缓冲区过大
-    if (s->wb_size >= s->warn_size) {
-        result->opaque = s->opaque;
-        result->id = s->id;
-        result->ud = s->wb_size / 1024;
-        result->data = NULL;
-        return SOCKET_WARNING;
-    }
-    
-    return -1;
-}
-```
+`send_socket`（`skynet-src/socket_server.c:1027`）负责将来自主线程的发送请求排队：
+
+- 通过 `send_object_init` 兼容三种缓冲类型（内存块、用户对象、原始指针），并拒绝处于 `HALFCLOSE_WRITE`、`PACCEPT` 或 `closing` 的 socket。
+- 对 TCP：若写队列为空，仍然把数据放入高优先级队列并启用写事件，由网络线程统一发送；对于 UDP，若队列为空则尝试一次 `sendto`，失败或部分发送再进入队列。
+- 当写队列非空时，根据优先级选择 `high`/`low` 链表；UDP 额外保存目标地址（如果调用者未提供则使用 `s->p.udp_address`）。
+- 每次入队后检测 `s->wb_size`，当超过 `WARNING_SIZE` 且达到动态阈值 `warn_size` 时返回 `SOCKET_WARNING`，并将阈值翻倍以避免重复告警。
 
 #### send_buffer - 发送缓冲区数据
 
-```c
-static int
-send_buffer(struct socket_server *ss, struct socket *s, 
-            struct socket_message *result) {
-    assert(!list_uncomplete(&s->low));
-    
-    // 1. 发送高优先级队列
-    while (!list_uncomplete(&s->high)) {
-        struct write_buffer *tmp = s->high.head;
-        
-        for (;;) {
-            int sz = write(s->fd, tmp->ptr, tmp->sz);
-            if (sz < 0) {
-                switch (errno) {
-                case AGAIN_WOULDBLOCK:
-                    return -1;
-                case EINTR:
-                    continue;
-                default:
-                    force_close(ss, s, result);
-                    return SOCKET_CLOSE;
-                }
-            }
-            
-            s->stat.write += sz;
-            s->wb_size -= sz;
-            
-            if (sz != tmp->sz) {
-                // 部分发送
-                tmp->ptr += sz;
-                tmp->sz -= sz;
-                return -1;
-            }
-            
-            break;
-        }
-        
-        // 移除已发送的缓冲区
-        s->high.head = tmp->next;
-        if (s->high.head == NULL) {
-            s->high.tail = NULL;
-        }
-        free_buffer(ss, tmp);
-    }
-    
-    // 2. 发送低优先级队列
-    while (!list_uncomplete(&s->low)) {
-        // 类似高优先级队列的处理...
-    }
-    
-    // 3. 全部发送完成，关闭写事件
-    sp_enable(ss->event_fd, s->fd, s, true, false);
-    s->writing = false;
-    
-    return -1;
-}
-```
+`send_buffer`（`skynet-src/socket_server.c:880`）运行在网络线程内：
+
+- 使用 `socket_trylock` 与 `dw_lock` 配合，若存在直写残留 (`dw_buffer`) 会优先拼接到高优先级队列头部。
+- 先发送 `high` 队列，再发送 `low` 队列；写入时根据 `EINTR`/`EAGAIN` 继续或暂缓，其他错误则转为 `SOCKET_ERR/ SOCKET_RST`。
+- 队列清空后调用 `enable_write(..., false)` 关闭写事件，并在需要时重置 `warn_size`，触发一次 `SOCKET_WARNING`（`ud=0` 表示恢复正常）。
+- 若 socket 正处于 `closing` 状态且队列耗尽，会最终调用 `force_close` 完成资源释放。
 
 ### 4.4 关闭和清理
 
-```c
-static void
-force_close(struct socket_server *ss, struct socket *s, 
-            struct socket_message *result) {
-    result->id = s->id;
-    result->opaque = s->opaque;
-    result->ud = 0;
-    result->data = NULL;
-    
-    // 1. 从事件监听中移除
-    if (s->fd >= 0) {
-        sp_del(ss->event_fd, s->fd);
-        close(s->fd);
-        s->fd = -1;
-    }
-    
-    // 2. 清理写缓冲区
-    free_wb_list(ss, &s->high);
-    free_wb_list(ss, &s->low);
-    s->wb_size = 0;
-    
-    // 3. 重置状态
-    ATOM_STORE(&s->type, SOCKET_TYPE_INVALID);
-}
-```
+`force_close`（`skynet-src/socket_server.c:480`）负责最终清理：
+
+- 解除事件注册并关闭 fd（UDP `BIND` 类型只解除注册，不主动关闭 fd）。
+- 释放高/低队列及可能残留的 `dw_buffer`，同时将 `wb_size` 清零。
+- 将状态置回 `SOCKET_TYPE_INVALID` 并把结果写入 `result`（`id`、`opaque` 保留供上层识别）。
 
 ## 5. 事件处理机制
 
 ### 5.1 主事件循环
 
-```c
-int
-socket_server_poll(struct socket_server *ss, struct socket_message *result, int *more) {
-    // 1. 处理上一批事件的剩余
-    while (ss->event_index < ss->event_n) {
-        struct event *e = &ss->ev[ss->event_index++];
-        struct socket *s = e->s;
-        
-        // 处理错误
-        if (e->error) {
-            force_close(ss, s, result);
-            return SOCKET_ERROR;
-        }
-        
-        // 处理读事件
-        if (e->read) {
-            int type = ATOM_LOAD(&s->type);
-            if (type == SOCKET_TYPE_LISTEN) {
-                report_accept(ss, s, result);
-                return SOCKET_ACCEPT;
-            } else {
-                int ret = forward_message_tcp(ss, s, result);
-                if (ret >= 0)
-                    return ret;
-            }
-        }
-        
-        // 处理写事件
-        if (e->write) {
-            int ret = send_buffer(ss, s, result);
-            if (ret >= 0)
-                return ret;
-        }
-    }
-    
-    // 2. 处理控制命令
-    if (ss->checkctrl) {
-        if (has_cmd(ss)) {
-            int type = ctrl_cmd(ss, result);
-            if (type != -1) {
-                ss->checkctrl = 0;
-                return type;
-            }
-        }
-        ss->checkctrl = 0;
-    }
-    
-    // 3. 等待新事件
-    ss->event_n = sp_wait(ss->event_fd, ss->ev, MAX_EVENT);
-    ss->event_index = 0;
-    ss->checkctrl = 1;
-    
-    *more = 1;
-    return -1;
-}
-```
+`socket_server_poll`（`skynet-src/socket_server.c:1700`）是网络线程的核心循环：
+
+- 优先消费上一轮缓存的事件（`ss->event_index < ss->event_n`），按 socket 状态分派到 `report_connect`、`report_accept`、`forward_message_tcp/udp`、`send_buffer` 等分支。
+- 当 `SOCKET_MORE` 或 `SOCKET_UDP` 需要继续拉取时，会调整 `event_index` 以便重复处理当前事件。
+- 每轮事件处理完毕后检查控制管道：通过 `select` 的零超时快速判断是否有新命令（`has_cmd`），存在则立即执行 `ctrl_cmd`，保证控制指令高优先级。
+- 若事件队列耗尽，则调用 `sp_wait` 阻塞等待新事件，同时设置 `*more=0`；如被信号打断则继续循环。
+- 返回值为上层消息类型（`SOCKET_DATA`、`SOCKET_ACCEPT`、`SOCKET_WARNING` 等），未产生事件时返回 -1。
 
 ### 5.2 控制命令处理
 
-Skynet使用管道实现异步命令传递：
+Skynet 使用管道实现主线程与网络线程的命令通信：
 
-```c
-// 发送命令（从主线程）
-static int
-send_request(struct socket_server *ss, struct request_package *request, 
-             char type, int len) {
-    request->header[6] = (uint8_t)type;
-    request->header[7] = (uint8_t)len;
-    
-    // 写入管道
-    for (;;) {
-        ssize_t n = write(ss->sendctrl_fd, &request->header[6], len+2);
-        if (n < 0) {
-            if (errno != EINTR) {
-                return -1;
-            }
-            continue;
-        }
-        return 0;
-    }
-}
-
-// 处理命令（网络线程）
-static int
-ctrl_cmd(struct socket_server *ss, struct socket_message *result) {
-    int fd = ss->recvctrl_fd;
-    uint8_t header[2];
-    int n = read(fd, header, sizeof(header));
-    
-    if (n != 2) {
-        return -1;
-    }
-    
-    int type = header[0];
-    int len = header[1];
-    
-    char buffer[256];
-    n = read(fd, buffer, len);
-    
-    // 根据命令类型分发
-    switch (type) {
-    case 'S':  // Send
-        return send_socket(...);
-    case 'O':  // Open (connect)
-        return open_socket(...);
-    case 'L':  // Listen
-        return listen_socket(...);
-    case 'X':  // Exit
-        return -1;
-    // ... 更多命令类型
-    }
-}
-```
-
-命令类型定义：
-
-```c
-// 'S' - 发送数据
-// 'O' - 主动连接
-// 'L' - 监听端口
-// 'B' - 绑定socket
-// 'C' - 关闭socket
-// 'A' - 启动socket
-// 'R' - 恢复读
-// 'P' - 暂停读
-// 'K' - 关闭socket（shutdown）
-// 'T' - 设置选项
-// 'U' - UDP相关
-// 'D' - UDP设置
-// 'X' - 退出
-```
+- `send_request`（`skynet-src/socket_server.c:1835`）在请求头部写入命令类型和长度，再把 payload 一并写入 `sendctrl_fd`；遇到 `EINTR` 会重试，其余错误会记录日志。
+- 网络线程通过 `has_cmd` + `ctrl_cmd`（`skynet-src/socket_server.c:1405`）读取 `recvctrl_fd`：先读取头部，再按类型（`'D'`/`'P'` 发送、`'W'` 触发写、`'K'` 关闭、`'R'/'S'` 控制读、`'O'` 连接、`'L'` 监听、`'U'` 创建 UDP 等）解析 payload，转交给对应函数。
+- 命令覆盖发送、连接、监听、暂停/恢复读、设置选项、UDP 操作以及退出网络线程等核心场景，保证框架层操作快速、生效可控。
 
 ## 6. 缓冲区管理
 
@@ -1092,34 +660,7 @@ list_uncomplete(struct wb_list *s) {
 
 ### 6.2 Direct Write 优化
 
-Direct Write是一种优化技术，当写缓冲区为空时，直接发送数据而不经过缓冲区：
-
-```c
-// Direct Write 流程
-if (s->wb_size == 0 && s->sending == 0) {
-    // 1. 设置发送标志（防止并发）
-    ATOM_FINC(&s->sending);
-    
-    // 2. 直接调用write
-    int n = write(s->fd, data, size);
-    
-    // 3. 清除发送标志
-    ATOM_FDEC(&s->sending);
-    
-    if (n == size) {
-        // 全部发送成功，无需缓冲
-        return;
-    }
-    
-    // 4. 剩余数据加入缓冲区
-    // ...
-}
-```
-
-优势：
-- 减少一次内存复制
-- 降低延迟
-- 减少缓冲区管理开销
+Direct Write 逻辑位于 `socket_server_send`（`skynet-src/socket_server.c:1894`）：主线程在将请求写入管道前会尝试直接写 socket。满足条件（队列为空、socket 已连接、无 UDP dial）且加锁成功时，直接调用 `write`/`sendto`。\n+\n+- 完全写入成功：立即返回并由调用方释放缓冲，避免落盘到队列。\n+- 部分写入：将剩余数据克隆到 `dw_buffer`，同时投递一个 `'W'` 控制命令，交由网络线程继续发送。\n+- 写入失败：不报错，转而走常规队列逻辑。\n+\n+这种设计避免了主线程与网络线程之间多一次内存复制，同时确保真正的写操作仍由网络线程统一收尾。
 
 ### 6.3 优先级队列
 
@@ -1154,105 +695,20 @@ static int send_buffer(...) {
 
 ### 7.1 UDP支持
 
-```c
-// 创建UDP socket
-static int
-do_bind(struct socket_server *ss, struct request_bind *request, 
-        struct socket_message *result) {
-    int id = request->id;
-    int sock = request->fd;
-    struct socket *ns = &ss->slot[HASH_ID(id)];
-    
-    // 设置非阻塞
-    sp_nonblocking(sock);
-    
-    // 初始化
-    ns->fd = sock;
-    ns->opaque = request->opaque;
-    ns->protocol = PROTOCOL_UDP;
-    ATOM_STORE(&ns->type, SOCKET_TYPE_BIND);
-    
-    // 加入事件监听
-    sp_add(ss->event_fd, sock, ns);
-    
-    return 0;
-}
-
-// UDP发送
-static int
-send_socket_udp(struct socket_server *ss, struct request_send_udp *request, 
-                struct socket_message *result) {
-    struct socket *s = &ss->slot[HASH_ID(request->send.id)];
-    
-    // 构造UDP地址
-    struct sockaddr_storage sa;
-    socklen_t sasz = udp_socket_address(s, request->address, &sa);
-    
-    // 发送数据
-    int n = sendto(s->fd, request->send.buffer, request->send.sz, 
-                   0, (struct sockaddr *)&sa, sasz);
-    
-    if (n < 0) {
-        return -1;
-    }
-    
-    return 0;
-}
-
-// UDP接收
-static int
-forward_message_udp(struct socket_server *ss, struct socket *s, 
-                    struct socket_message *result) {
-    struct sockaddr_storage sa;
-    socklen_t salen = sizeof(sa);
-    
-    // 接收数据
-    int n = recvfrom(s->fd, ss->udpbuffer, MAX_UDP_PACKAGE, 
-                     0, (struct sockaddr *)&sa, &salen);
-    
-    if (n < 0) {
-        return -1;
-    }
-    
-    // 分配内存并复制数据+地址
-    char * data = skynet_malloc(n + UDP_ADDRESS_SIZE);
-    memcpy(data, ss->udpbuffer, n);
-    
-    // 编码地址信息
-    encode_udp_address(&sa, data + n);
-    
-    // 返回数据
-    result->data = data;
-    result->ud = UDP_ADDRESS_SIZE;
-    
-    return n;
-}
-```
+- `socket_server_udp`/`socket_server_udp_listen` 通过 `do_bind` 创建或绑定 UDP socket，最终在网络线程侧调用 `add_udp_socket` 将类型设置为 `SOCKET_TYPE_CONNECTED`（UDP）并注册事件。
+- 发送路径复用 `send_socket`：当队列为空时优先尝试一次 `sendto`，若失败则把数据连同地址打包进写队列，队列节点类型为 `write_buffer_udp` 并携带 `udp_address`。
+- `forward_message_udp`（`skynet-src/socket_server.c:1548`）使用 `recvfrom` 读取数据，随后通过 `gen_udp_address` 将远端地址编码附加在消息尾部，最终返回 `SOCKET_UDP`，其中 `result->ud = n`（实际数据长度），地址信息需由上层解析附加的尾部 19/35 字节。
 
 ### 7.2 Socket选项设置
 
+`setopt_socket`（`skynet-src/socket_server.c:1267`）当前仅简单地调用：
+
 ```c
-static int
-setopt_socket(struct socket_server *ss, struct request_setopt *request) {
-    int id = request->id;
-    struct socket *s = &ss->slot[HASH_ID(id)];
-    
-    switch (request->what) {
-    case TCP_NODELAY:
-        // 禁用Nagle算法
-        return setsockopt(s->fd, IPPROTO_TCP, TCP_NODELAY, 
-                          &request->value, sizeof(request->value));
-    
-    case SO_KEEPALIVE:
-        // 启用TCP保活
-        return setsockopt(s->fd, SOL_SOCKET, SO_KEEPALIVE, 
-                          &request->value, sizeof(request->value));
-    
-    default:
-        return -1;
-    }
-}
+int v = request->value;
+setsockopt(s->fd, IPPROTO_TCP, request->what, &v, sizeof(v));
 ```
+
+即默认以 `IPPROTO_TCP` 为层级，适用于 `TCP_NODELAY`、`TCP_QUICKACK` 等 TCP 选项；调用者若需要设置 `SO_KEEPALIVE` 等其他选项，需要在上层扩展实现。
 
 ### 7.3 统计信息
 

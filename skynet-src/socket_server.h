@@ -5,18 +5,19 @@
 #include "socket_info.h"
 #include "socket_buffer.h"
 
-#define SOCKET_DATA 0
-#define SOCKET_CLOSE 1
-#define SOCKET_OPEN 2
-#define SOCKET_ACCEPT 3
-#define SOCKET_ERR 4
-#define SOCKET_EXIT 5
-#define SOCKET_UDP 6
-#define SOCKET_WARNING 7
+#define SOCKET_DATA 0		/* 数据到达：result->data 指向 payload，ud 为字节数 */
+#define SOCKET_CLOSE 1		/* 连接关闭：本地或远端关闭，data == NULL */
+#define SOCKET_OPEN 2		/* 主动连接 / 监听成功：data 可能包含地址 */
+#define SOCKET_ACCEPT 3		/* 被动接受新连接：ud 为新 socket id */
+#define SOCKET_ERR 4		/* 错误事件：data 指向错误描述字符串 */
+#define SOCKET_EXIT 5		/* 网络线程退出（socket_server_exit） */
+#define SOCKET_UDP 6		/* UDP 消息，data 末尾附带地址信息 */
+#define SOCKET_WARNING 7	/* 写缓冲告警：ud 为 KB，0 表示告警解除 */
 
+/* 内部专用的附加事件类型 */
 // Only for internal use
-#define SOCKET_RST 8
-#define SOCKET_MORE 9
+#define SOCKET_RST 8		/* 写入发生错误并触发重置 */
+#define SOCKET_MORE 9		/* TCP 多包读取，本次数据尚未完全读完 */
 
 struct socket_server;
 
@@ -27,11 +28,13 @@ struct socket_message {
 	char * data;
 };
 
+/* 核心接口：创建/释放 socket_server，并在网络线程内轮询事件 */
 struct socket_server * socket_server_create(uint64_t time);
 void socket_server_release(struct socket_server *);
 void socket_server_updatetime(struct socket_server *, uint64_t time);
 int socket_server_poll(struct socket_server *, struct socket_message *result, int *more);
 
+/* 基础控制命令：退出、关闭、shutdown、启动读、暂停读等 */
 void socket_server_exit(struct socket_server *);
 void socket_server_close(struct socket_server *, uintptr_t opaque, int id);
 void socket_server_shutdown(struct socket_server *, uintptr_t opaque, int id);

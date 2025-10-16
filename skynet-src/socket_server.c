@@ -1,6 +1,13 @@
 #include "skynet.h"
 
 #include "socket_server.h"
+
+/*
+ *   socket_server.c 是 Skynet 网络线程的核心实现。
+ *   - 负责接收主线程发出的命令（通过管道）并执行。
+ *   - 维护所有 socket 的生命周期、缓冲区与状态。
+ *   - 通过 epoll/kqueue 抢占式轮询网络事件。
+ */
 #include "socket_poll.h"
 #include "atomic.h"
 #include "spinlock.h"
@@ -17,21 +24,22 @@
 #include <assert.h>
 #include <string.h>
 
-#define MAX_INFO 128
+/* ---- 常量定义：与 socket 状态管理与缓冲池容量相关 ---- */
+#define MAX_INFO 128			// 临时字符串缓冲区大小
 // MAX_SOCKET will be 2^MAX_SOCKET_P
-#define MAX_SOCKET_P 16
-#define MAX_EVENT 64
-#define MIN_READ_BUFFER 64
-#define SOCKET_TYPE_INVALID 0
-#define SOCKET_TYPE_RESERVE 1
-#define SOCKET_TYPE_PLISTEN 2
-#define SOCKET_TYPE_LISTEN 3
-#define SOCKET_TYPE_CONNECTING 4
-#define SOCKET_TYPE_CONNECTED 5
-#define SOCKET_TYPE_HALFCLOSE_READ 6
-#define SOCKET_TYPE_HALFCLOSE_WRITE 7
-#define SOCKET_TYPE_PACCEPT 8
-#define SOCKET_TYPE_BIND 9
+#define MAX_SOCKET_P 16			// 支持的最大 socket 数量（65536）
+#define MAX_EVENT 64			// 单次 epoll/kqueue 等待的最大事件数
+#define MIN_READ_BUFFER 64		// TCP 读缓冲的最小起始值
+#define SOCKET_TYPE_INVALID 0		// 未使用槽位
+#define SOCKET_TYPE_RESERVE 1		// 已被 reserve_id 占用，但尚未 new_fd
+#define SOCKET_TYPE_PLISTEN 2		// 监听 socket，等待 START 命令
+#define SOCKET_TYPE_LISTEN 3		// 正式监听状态
+#define SOCKET_TYPE_CONNECTING 4	// 发起连接中
+#define SOCKET_TYPE_CONNECTED 5		// 已连接状态
+#define SOCKET_TYPE_HALFCLOSE_READ 6	// 已半关闭读
+#define SOCKET_TYPE_HALFCLOSE_WRITE 7	// 已半关闭写
+#define SOCKET_TYPE_PACCEPT 8		// accept 刚创建，尚未反馈给上层
+#define SOCKET_TYPE_BIND 9		// UDP 绑定 socket
 
 #define MAX_SOCKET (1<<MAX_SOCKET_P)
 
@@ -61,6 +69,7 @@
 
 #define USEROBJECT ((size_t)(-1))
 
+/* 写缓冲节点：串联形成 high/low 发送队列。 */
 struct write_buffer {
 	struct write_buffer * next;    // 链表指针
 	const void *buffer;           // 数据缓冲区指针
@@ -69,11 +78,13 @@ struct write_buffer {
 	bool userobject;              // 是否为用户对象
 };
 
+/* UDP 的写缓冲在节点尾部多保存一个目标地址。 */
 struct write_buffer_udp {
 	struct write_buffer buffer;
 	uint8_t udp_address[UDP_ADDRESS_SIZE];
 };
 
+/* 双端链表结构，分别用于高优先级与低优先级写队列。 */
 struct wb_list {
 	struct write_buffer * head;
 	struct write_buffer * tail;
@@ -113,7 +124,7 @@ struct socket {
 	size_t dw_size;                // 直写大小
 };
 
-// 整个socket服务器状态
+/* socket_server：网络线程运行期的核心上下文。 */
 struct socket_server {
 	volatile uint64_t time;        // 当前时间戳
 	int reserve_fd;	// for EMFILE   // 预留fd，用于EMFILE错误处理
@@ -354,6 +365,12 @@ socket_keepalive(int fd) {
 	setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (void *)&keepalive , sizeof(keepalive));
 }
 
+/* 
+ * reserve_id：
+ *   - 为新 socket 分配唯一 id，并占用槽位。
+ *   - 利用自增计数和取模避免频繁遍历空槽。
+ *   - 引入 CAS 防止多线程竞争造成重复占用。
+ */
 static int
 reserve_id(struct socket_server *ss) {
 	int i;
@@ -389,6 +406,12 @@ clear_wb_list(struct wb_list *list) {
 	list->tail = NULL;
 }
 
+/*
+ * 初始化网络线程：
+ *   1. 创建 epoll/kqueue 实例与控制管道。
+ *   2. 预留一个额外 fd，用于处理 EMFILE 时的“解锁”策略。
+ *   3. 重置所有槽位，等待 reserve_id/new_fd 使用。
+ */
 struct socket_server *
 socket_server_create(uint64_t time) {
 	int i;
@@ -568,6 +591,12 @@ enable_read(struct socket_server *ss, struct socket *s, bool enable) {
 	return 0;
 }
 
+/*
+ * 将 reserve_id 预留的槽位正式初始化：
+ *   - 注册到 epoll/kqueue 并开启默认读监听。
+ *   - 填充 socket 结构的初始状态（协议、缓冲区、统计信息）。
+ *   - 若 enable_read 失败（通常是 sp_enable 返回错误），则回滚状态。
+ */
 static struct socket *
 new_fd(struct socket_server *ss, int id, int fd, int protocol, uintptr_t opaque, bool reading) {
 	struct socket * s = &ss->slot[HASH_ID(id)];
@@ -617,6 +646,7 @@ stat_write(struct socket_server *ss, struct socket *s, int n) {
 static int
 open_socket(struct socket_server *ss, struct request_open * request, struct socket_message *result) {
 	int id = request->id;
+	/* 将调用者的 opaque 回传，便于上层定位服务 */
 	result->opaque = request->opaque;
 	result->id = id;
 	result->ud = 0;
@@ -628,11 +658,13 @@ open_socket(struct socket_server *ss, struct request_open * request, struct sock
 	struct addrinfo *ai_ptr = NULL;
 	char port[16];
 	sprintf(port, "%d", request->port);
+	/* 设置地址解析提示，允许 IPv4/IPv6 */
 	memset(&ai_hints, 0, sizeof( ai_hints ) );
-	ai_hints.ai_family = AF_UNSPEC;
-	ai_hints.ai_socktype = SOCK_STREAM;
+	ai_hints.ai_family = AF_UNSPEC;      // 支持 IPv4/IPv6
+	ai_hints.ai_socktype = SOCK_STREAM;  // TCP流
 	ai_hints.ai_protocol = IPPROTO_TCP;
 
+	/* 解析域名/IP地址 */
 	status = getaddrinfo( request->host, port, &ai_hints, &ai_list );
 	if ( status != 0 ) {
 		result->data = (void *)gai_strerror(status);
@@ -642,7 +674,7 @@ open_socket(struct socket_server *ss, struct request_open * request, struct sock
 	for (ai_ptr = ai_list; ai_ptr != NULL; ai_ptr = ai_ptr->ai_next ) {
 		sock = socket( ai_ptr->ai_family, ai_ptr->ai_socktype, ai_ptr->ai_protocol );
 		if ( sock < 0 ) {
-			continue;
+			continue;  // 创建失败,尝试下一个地址
 		}
 		socket_keepalive(sock);
 		sp_nonblocking(sock);
@@ -660,6 +692,7 @@ open_socket(struct socket_server *ss, struct request_open * request, struct sock
 		goto _failed;
 	}
 
+	/* 将 fd 注册到 socket_server */
 	ns = new_fd(ss, id, sock, PROTOCOL_TCP, request->opaque, true);
 	if (ns == NULL) {
 		result->data = "reach skynet socket number limit";
@@ -667,6 +700,7 @@ open_socket(struct socket_server *ss, struct request_open * request, struct sock
 	}
 
 	if(status == 0) {
+		/* 立即连接成功，标记为已连接并返回对端地址文本 */
 		ATOM_STORE(&ns->type , SOCKET_TYPE_CONNECTED);
 		struct sockaddr * addr = ai_ptr->ai_addr;
 		void * sin_addr = (ai_ptr->ai_family == AF_INET) ? (void*)&((struct sockaddr_in *)addr)->sin_addr : (void*)&((struct sockaddr_in6 *)addr)->sin6_addr;
@@ -676,6 +710,7 @@ open_socket(struct socket_server *ss, struct request_open * request, struct sock
 		freeaddrinfo( ai_list );
 		return SOCKET_OPEN;
 	} else {
+		/* 仍在连接中，开启写事件等待回调 */
 		if (enable_write(ss, ns, true)) {
 			result->data = "enable write failed";
 			goto _failed;
@@ -1397,7 +1432,13 @@ dec_sending_ref(struct socket_server *ss, int id) {
 	}
 }
 
-// return type
+/*
+ * ctrl_cmd：网络线程读取管道指令并执行。
+ *   - header[0]：命令类型（字符），header[1]：payload 长度。
+ *   - 根据不同命令转换为 resume/pause/bind/listen/open 等操作。
+ *   - 返回值统一为 socket 事件类型，供 socket_server_poll 直接上报。
+ *   - return type
+ */
 static int
 ctrl_cmd(struct socket_server *ss, struct socket_message *result) {
 	int fd = ss->recvctrl_fd;
@@ -1460,7 +1501,13 @@ ctrl_cmd(struct socket_server *ss, struct socket_message *result) {
 	return -1;
 }
 
-// return -1 (ignore) when error
+/*
+ * forward_message_tcp：处理 TCP 读事件。
+ *   - 动态调整读取缓冲（倍增/减半）。
+ *   - 处理半关闭、关闭以及错误并上报对应事件。
+ *   - 若本次读取恰好填满缓冲，返回 SOCKET_MORE，提示上层继续拉取。
+ *   - return -1 (ignore) when error
+ */
 static int
 forward_message_tcp(struct socket_server *ss, struct socket *s, struct socket_lock *l, struct socket_message * result) {
 	int sz = s->p.size;
@@ -1541,6 +1588,12 @@ gen_udp_address(int protocol, union sockaddr_all *sa, uint8_t * udp_address) {
 	return addrsz;
 }
 
+/*
+ * forward_message_udp：
+ *   - recvfrom 读取数据并保存到临时大缓冲 udpbuffer。
+ *   - 根据 ip 版本编码地址信息（type + port + ip）。
+ *   - 返回 SOCKET_UDP，上层通过 socket_udp_address 解析地址。
+ */
 static int
 forward_message_udp(struct socket_server *ss, struct socket *s, struct socket_lock *l, struct socket_message * result) {
 	union sockaddr_all sa;
@@ -1705,7 +1758,14 @@ clear_closed_event(struct socket_server *ss, struct socket_message * result, int
 	}
 }
 
-// return type
+/*
+ * 网络线程主循环：
+ *   - 优先检查控制命令，保证主线程请求及时处理。
+ *   - 若当前批事件已消费完毕，则阻塞等待新的 epoll/kqueue 事件。
+ *   - 根据 socket 当前状态选择 report_connect / report_accept / forward_message / send_buffer。
+ *   - 通过 clear_closed_event 避免重复处理已关闭的 socket。
+ *   - return type
+ */
 int
 socket_server_poll(struct socket_server *ss, struct socket_message * result, int * more) {
 	for (;;) {
@@ -1828,6 +1888,11 @@ socket_server_poll(struct socket_server *ss, struct socket_message * result, int
 	}
 }
 
+/*
+ * 主线程 -> 网络线程 指令通道：
+ *   header[6] 存放命令类型，header[7] 存放 payload 长度。
+ *   写入管道时保证一次性写完（len + 2 字节），如被信号打断则重试。
+ */
 static void
 send_request(struct socket_server *ss, struct request_package *request, char type, int len) {
 	request->header[6] = (uint8_t)type;
@@ -1886,7 +1951,13 @@ can_direct_write(struct socket *s, int id) {
 	return s->id == id && nomore_sending_data(s) && ATOM_LOAD(&s->type) == SOCKET_TYPE_CONNECTED && ATOM_LOAD(&s->udpconnecting) == 0;
 }
 
-// return -1 when error, 0 when success
+/*
+ * 主线程调用入口：
+ *   - 优先尝试 Direct Write，避免排队等待网络线程。
+ *   - 失败或部分写入时，将数据克隆到 request_package，通过 'D' 命令交给网络线程。
+ *   - 发送结束需要配合 inc/dec_sending_ref 维护 sending 计数。
+ *   - return -1 when error, 0 when success
+ */
 int
 socket_server_send(struct socket_server *ss, struct socket_sendbuffer *buf) {
 	int id = buf->id;

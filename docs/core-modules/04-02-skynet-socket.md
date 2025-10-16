@@ -44,22 +44,23 @@ skynet_socket.c是Skynet网络系统中连接底层socket_server和上层服务�
 struct skynet_socket_message {
     int type;        // 消息类型（数据/连接/关闭等）
     int id;          // socket ID，唯一标识一个连接
-    int ud;          // 用户数据，含义根据type不同而变化
-    char * buffer;   // 数据缓冲区指针
+    int ud;          // 附带字段，语义取决于 type
+    char * buffer;   // 数据缓冲区指针（或 NULL ）
 };
 ```
 
 **字段说明**：
-- `type`：定义了7种网络事件类型，见2.2节
-- `id`：socket的唯一标识符，由socket_server分配
+- `type`：见2.2节，取值范围 1~7（没有 0）。
+- `id`：socket_server 分配的句柄，用于定位连接。
 - `ud`：
-  - 对于DATA类型：数据长度
-  - 对于ACCEPT类型：新连接的socket id
-  - 对于其他类型：保留用户数据
+  - `SKYNET_SOCKET_TYPE_DATA/UDP`：有效负载长度。
+  - `SKYNET_SOCKET_TYPE_ACCEPT`：新连接的 socket id。
+  - `SKYNET_SOCKET_TYPE_WARNING`：当前写缓冲大小（KB）。
+  - 其他类型通常为 0 或预留值。
 - `buffer`：
-  - DATA/UDP类型：指向实际数据
-  - ERROR/WARNING类型：错误描述字符串（内嵌存储）
-  - 其他类型：可能为NULL
+  - DATA/UDP 类型沿用 socket_server 的数据指针，由业务在使用后释放。
+  - CONNECT/ACCEPT/ERROR 会将字符串内嵌到结构体尾部（padding），此时 `buffer == NULL`，需通过 `(const char *)(sm + 1)` 访问文本。
+  - 其他类型可能为 `NULL`。
 
 ### 2.2 消息类型定义
 
@@ -71,6 +72,8 @@ struct skynet_socket_message {
 #define SKYNET_SOCKET_TYPE_ERROR   5  // 连接错误
 #define SKYNET_SOCKET_TYPE_UDP     6  // UDP数据
 #define SKYNET_SOCKET_TYPE_WARNING 7  // 警告信息（如缓冲区溢出）
+
+> `SKYNET_SOCKET_TYPE_CONNECT` 既用于主动连接成功的回调，也用于 `start`/`transfer` 的确认消息；需要结合消息体中的附加字符串判断上下文。
 ```
 
 ### 2.3 与socket_message的映射关系
@@ -127,6 +130,23 @@ void skynet_socket_exit() {
 **功能**：通知socket_server退出
 **作用**：向管道发送退出命令，触发poll返回SOCKET_EXIT
 
+#### skynet_socket_free
+```c
+void skynet_socket_free() {
+    socket_server_release(SOCKET_SERVER);
+    SOCKET_SERVER = NULL;
+}
+```
+**功能**：释放底层 socket_server 资源（在框架关闭阶段调用）。
+
+#### skynet_socket_updatetime
+```c
+void skynet_socket_updatetime() {
+    socket_server_updatetime(SOCKET_SERVER, skynet_now());
+}
+```
+**功能**：更新 socket_server 内部的时间戳（用于统计/超时），由主线程定期调用。
+
 #### skynet_socket_poll
 ```c
 int skynet_socket_poll() {
@@ -145,7 +165,22 @@ int skynet_socket_poll() {
     case SOCKET_CLOSE:
         forward_message(SKYNET_SOCKET_TYPE_CLOSE, false, &result);
         break;
-    // ... 其他类型处理
+    case SOCKET_OPEN:
+        forward_message(SKYNET_SOCKET_TYPE_CONNECT, true, &result);
+        break;
+    case SOCKET_ACCEPT:
+        forward_message(SKYNET_SOCKET_TYPE_ACCEPT, true, &result);
+        break;
+    case SOCKET_ERR:
+        forward_message(SKYNET_SOCKET_TYPE_ERROR, true, &result);
+        break;
+    case SOCKET_UDP:
+        forward_message(SKYNET_SOCKET_TYPE_UDP, false, &result);
+        break;
+    case SOCKET_WARNING:
+        forward_message(SKYNET_SOCKET_TYPE_WARNING, false, &result);
+        break;
+    // 其他类型处理
     }
     if (more) {
         return -1;  // 还有更多事件待处理
@@ -158,6 +193,8 @@ int skynet_socket_poll() {
 - 0：系统退出
 - 1：正常处理完成
 - -1：还有更多事件待处理
+
+**注意**：当 `padding` 为 `true` 时（CONNECT/ACCEPT/ERROR），字符串内容被复制到 `sm + 1` 的内存区域，读取时需自行转换指针。
 
 ### 3.2 TCP操作
 
@@ -188,6 +225,15 @@ int skynet_socket_connect(struct skynet_context *ctx,
 **功能**：主动建立TCP连接
 **特点**：异步操作，立即返回socket id，连接结果通过消息通知
 
+#### skynet_socket_bind
+```c
+int skynet_socket_bind(struct skynet_context *ctx, int fd) {
+    uint32_t source = skynet_context_handle(ctx);
+    return socket_server_bind(SOCKET_SERVER, source, fd);
+}
+```
+**功能**：将已有的 fd 纳入 Skynet 管理（常见于 accept 在 C 层完成的场景）。
+
 #### skynet_socket_start
 ```c
 void skynet_socket_start(struct skynet_context *ctx, int id) {
@@ -195,8 +241,10 @@ void skynet_socket_start(struct skynet_context *ctx, int id) {
     socket_server_start(SOCKET_SERVER, source, id);
 }
 ```
-**功能**：启动socket接收
-**重要**：新连接默认是暂停状态，必须调用start才能接收数据
+**功能**：开启 socket 的读事件。
+**重要**：
+- 监听 socket 与新接入的连接（`SKYNET_SOCKET_TYPE_ACCEPT`）默认处于暂停状态，必须调用 `start` 才能收到数据。
+- 主动连接在收到 `CONNECT` 事件后也需调用 `start`，否则不会继续读取数据。
 
 #### skynet_socket_close
 ```c
@@ -218,6 +266,14 @@ void skynet_socket_shutdown(struct skynet_context *ctx, int id) {
 **功能**：优雅关闭连接
 **特点**：发送完缓冲区数据后关闭
 
+#### skynet_socket_pause / skynet_socket_nodelay
+```c
+void skynet_socket_pause(struct skynet_context *ctx, int id);
+void skynet_socket_nodelay(struct skynet_context *ctx, int id);
+```
+- `pause`：临时关闭读事件，再次调用 `start` 恢复。
+- `nodelay`：在 TCP 连接上设置 `TCP_NODELAY`，关闭 Nagle 算法。
+
 ### 3.3 数据传输
 
 #### skynet_socket_send（内联函数）
@@ -233,7 +289,7 @@ static inline int skynet_socket_send(struct skynet_context *ctx,
 **参数**：
 - `id`：socket id
 - `buffer`：数据缓冲区
-- `sz`：数据大小（负数表示用户对象）
+- `sz`：数据大小；若传入负值，表示 `buffer` 指向用户对象，真实大小由 `socket_object_interface` 回调提供
 
 #### skynet_socket_sendbuffer
 ```c
@@ -243,7 +299,7 @@ int skynet_socket_sendbuffer(struct skynet_context *ctx,
 }
 ```
 **功能**：发送缓冲区数据
-**特点**：支持多种缓冲区类型（内存、对象、原始指针）
+**特点**：支持多种缓冲区类型（内存、对象、原始指针），其中 RAWPOINTER 模式要求调用方保证数据在发送完成前保持有效
 
 #### skynet_socket_send_lowpriority
 ```c
@@ -272,6 +328,14 @@ int skynet_socket_udp(struct skynet_context *ctx,
 - `addr`：绑定地址（NULL表示任意地址）
 - `port`：绑定端口（0表示不绑定）
 
+#### skynet_socket_udp_dial / skynet_socket_udp_listen
+```c
+int skynet_socket_udp_dial(struct skynet_context *ctx, const char * addr, int port);
+int skynet_socket_udp_listen(struct skynet_context *ctx, const char * addr, int port);
+```
+- `udp_dial`：创建一个 UDP 句柄并立即连接到目标地址（常用于客户端）。
+- `udp_listen`：创建并绑定 UDP 端口（常用于服务端）。
+
 #### skynet_socket_udp_send
 ```c
 static inline int skynet_socket_udp_send(struct skynet_context *ctx, 
@@ -283,7 +347,7 @@ static inline int skynet_socket_udp_send(struct skynet_context *ctx,
 }
 ```
 **功能**：发送UDP数据
-**特点**：address参数是socket_udp_address结构的指针
+**特点**：`address` 参数使用 `skynet_socket_udp_address` 返回的指针（或 `NULL` 表示复用上一次 `udp_connect` 的地址）
 
 #### skynet_socket_udp_address
 ```c
@@ -301,7 +365,7 @@ const char * skynet_socket_udp_address(struct skynet_socket_message *msg,
 }
 ```
 **功能**：提取UDP消息的源地址
-**返回**：地址结构指针（用于回复）
+**返回**：指向消息尾部的地址结构指针（不要单独释放；在释放 `msg->buffer` 前使用）
 
 ## 第四部分：消息转换机制
 
@@ -313,7 +377,7 @@ static void forward_message(int type, bool padding,
     struct skynet_socket_message *sm;
     size_t sz = sizeof(*sm);
     
-    // padding用于错误消息，将错误描述内嵌在消息后面
+    // padding用于携带字符串（CONNECT/ACCEPT/ERROR 等），将文本内嵌在消息后面
     if (padding) {
         if (result->data) {
             size_t msg_sz = strlen(result->data);
@@ -387,16 +451,19 @@ graph TD
 1. **数据消息（DATA/UDP）**：
    - 数据内存由socket_server分配
    - 直接传递指针，避免复制
-   - 服务处理完后负责释放
+   - 服务处理完后负责释放；对 UDP 来说，源地址附加在 `buffer + ud` 处，可通过 `skynet_socket_udp_address` 解析
 
-2. **错误消息（ERROR/WARNING）**：
-   - 使用padding模式
-   - 错误描述内嵌存储在消息结构后
-   - 限制最大128字节
+2. **文本消息（CONNECT/ACCEPT/ERROR）**：
+   - 使用 padding 模式
+   - 将地址或错误描述内嵌存储在结构体之后，长度上限 128 字节
+   - 访问方式：`const char *str = (const char *)(sm + 1);`
 
-3. **控制消息（CONNECT/CLOSE/ACCEPT）**：
-   - 仅包含控制信息
-   - buffer字段可能为NULL或包含附加信息
+3. **告警消息（WARNING）**：
+   - 不使用 padding，`buffer == NULL`
+   - `ud` 表示当前写缓冲大小（KB），可据此限流
+
+4. **控制消息（CLOSE 等）**：
+   - 主要包含状态标识，`buffer` 通常为 `NULL`
 
 ### 4.4 消息推送流程
 
@@ -539,7 +606,7 @@ static int launch_listen(struct skynet_context * ctx) {
         return -1;
     }
     
-    // 启动接收（监听socket默认就是启动的）
+    // 启动接收（监听 socket 默认暂停，需显式 start）
     skynet_socket_start(ctx, listen_fd);
     
     // 保存listen_fd供后续使用
@@ -598,7 +665,10 @@ static void handle_connect(struct skynet_context * ctx,
         
         // 发送数据
         const char * hello = "Hello Server";
-        skynet_socket_send(ctx, msg->id, (void*)hello, strlen(hello));
+        size_t len = strlen(hello) + 1;
+        char * payload = skynet_malloc(len);
+        memcpy(payload, hello, len);
+        skynet_socket_send(ctx, msg->id, payload, (int)(len - 1));
     } else if (msg->type == SKYNET_SOCKET_TYPE_ERROR) {
         // 连接失败
         skynet_error(ctx, "Connect failed: %s", (char*)(msg+1));
@@ -611,22 +681,26 @@ static void handle_connect(struct skynet_context * ctx,
 ```c
 // 发送数据（多种方式）
 static void send_examples(struct skynet_context * ctx, int fd) {
-    // 方式1：简单发送
-    char * data = skynet_malloc(100);
-    strcpy(data, "test data");
-    skynet_socket_send(ctx, fd, data, strlen(data));
-    
-    // 方式2：低优先级发送（大数据）
-    char * bigdata = skynet_malloc(1024*1024);
+    // 方式1：简单发送（底层会使用 skynet_free 释放 data）
+    const char * payload = "test data";
+    size_t len = strlen(payload) + 1;
+    char * data1 = skynet_malloc(len);
+    memcpy(data1, payload, len);
+    skynet_socket_send(ctx, fd, data1, (int)(len - 1));
+
+    // 方式2：低优先级发送（适合大数据）
+    size_t bigsz = 1024 * 1024;
+    char * bigdata = skynet_malloc(bigsz);
     // ... fill bigdata
-    skynet_socket_send_lowpriority(ctx, fd, bigdata, 1024*1024);
-    
-    // 方式3：使用sendbuffer（更灵活）
+    skynet_socket_send_lowpriority(ctx, fd, bigdata, (int)bigsz);
+
+    // 方式3：使用 sendbuffer 指定类型（例如 RAWPOINTER，数据由调用方维护）
+    static const char keepalive[] = "ping";
     struct socket_sendbuffer buffer;
     buffer.id = fd;
-    buffer.type = SOCKET_BUFFER_MEMORY;
-    buffer.buffer = data;
-    buffer.sz = 100;
+    buffer.type = SOCKET_BUFFER_RAWPOINTER;
+    buffer.buffer = keepalive;
+    buffer.sz = sizeof(keepalive) - 1;
     skynet_socket_sendbuffer(ctx, &buffer);
 }
 
@@ -658,9 +732,12 @@ static int create_udp(struct skynet_context * ctx) {
 // 发送UDP数据
 static void send_udp(struct skynet_context * ctx, int udp_fd) {
     const char * data = "UDP message";
+    size_t len = strlen(data) + 1;
+    char * payload = skynet_malloc(len);
+    memcpy(payload, data, len);
     // 需要先连接或使用地址
     skynet_socket_udp_connect(ctx, udp_fd, "127.0.0.1", 8888);
-    skynet_socket_udp_send(ctx, udp_fd, NULL, data, strlen(data));
+    skynet_socket_udp_send(ctx, udp_fd, NULL, payload, (int)(len - 1));
 }
 
 // 处理UDP消息
@@ -679,7 +756,10 @@ static void handle_udp(struct skynet_context * ctx,
     
     // 回复（使用获取的地址）
     const char * reply = "UDP reply";
-    skynet_socket_udp_send(ctx, msg->id, addr, reply, strlen(reply));
+    size_t rlen = strlen(reply) + 1;
+    char * payload = skynet_malloc(rlen);
+    memcpy(payload, reply, rlen);
+    skynet_socket_udp_send(ctx, msg->id, addr, payload, (int)(rlen - 1));
     
     skynet_free(msg->buffer);
 }
@@ -690,12 +770,14 @@ static void handle_udp(struct skynet_context * ctx,
 ### 8.1 API使用规范
 
 1. **启动接收**：
-   - 新连接（accept的）必须调用`skynet_socket_start`
-   - 主动连接在CONNECT消息后调用start
-   - UDP socket无需调用start
+   - 监听 socket 在 `skynet_socket_listen` 之后仍需调用 `skynet_socket_start`
+   - 新连接（ACCEPT 消息）必须调用 `skynet_socket_start`
+   - 主动连接在 `CONNECT` 消息后调用 `start`
+   - UDP socket 自动开启读事件，无需调用 `start`
 
 2. **内存管理**：
-   - 发送的数据必须使用`skynet_malloc`分配
+   - 默认发送的数据应使用 `skynet_malloc` 分配（便于底层 `skynet_free`）
+   - 若需要复用自定义对象，可通过 `SOCKET_BUFFER_OBJECT` + `socket_server_userobject` 提供释放回调
    - 接收的数据处理完后必须`skynet_free`
    - 错误消息的buffer不需要释放（内嵌存储）
 
@@ -753,8 +835,7 @@ case SKYNET_SOCKET_TYPE_CLOSE:
 ```c
 case SKYNET_SOCKET_TYPE_WARNING:
     {
-        const char * warn = (const char *)(msg + 1);
-        skynet_error(ctx, "Socket warning: %s", warn);
+        skynet_error(ctx, "Socket %d warning: wbuffer=%dKB", msg->id, msg->ud);
         // 可能需要限流或暂停发送
     }
     break;
