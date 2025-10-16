@@ -20,7 +20,7 @@
 Skynet的定时器系统是整个框架时间管理的核心，提供以下功能：
 
 - **定时触发**：支持服务设置定时任务
-- **超时管理**：RPC调用的超时控制
+- **超时管理**：为协程阻塞提供超时打断能力（sleep / wait，可在业务层组合实现 RPC 超时）
 - **时间服务**：提供统一的时间基准
 - **延迟执行**：支持延迟消息投递
 
@@ -591,24 +591,46 @@ end)
 
 ### 7.3 RPC超时实现
 
+`skynet.call` 并不会自动设置超时——调用协程会一直挂起，直到收到目标服务的响应或错误消息（例如目标服务退出时发送的 `PTYPE_ERROR`）。如果业务需要超时保护，需要显式配合定时器组件自行实现，例如：
+
 ```lua
--- RPC调用的超时机制
-function skynet.call(addr, type, ...)
-    local session = c.send(addr, type, ...)
-    
-    -- 设置超时定时器
-    local timeout_session = c.intcommand("TIMEOUT", timeout_time)
-    
-    -- 等待响应或超时
-    local ret = yield_call(session)
-    
-    if ret == timeout_session then
-        error("call timeout")
+local skynet = require "skynet"
+
+local function call_with_timeout(addr, typename, timeout_cs, ...)
+    -- timeout_cs 以 centisecond 为单位（10ms）
+    local token = {}
+    local finished = false
+    local timeout = false
+    local result
+
+    skynet.fork(function()
+        result = table.pack(pcall(skynet.call, addr, typename, ...))
+        finished = true
+        if not timeout then
+            skynet.wakeup(token)
+        end
+    end)
+
+    skynet.timeout(timeout_cs, function()
+        if not finished then
+            timeout = true
+            skynet.wakeup(token)
+        end
+    end)
+
+    skynet.wait(token)
+
+    if timeout and not finished then
+        return nil, "timeout"
     end
-    
-    return ret
+    if result[1] then
+        return table.unpack(result, 2, result.n or #result)
+    end
+    error(result[2])
 end
 ```
+
+通过这种组合方式，可以利用定时器提供的协程唤醒能力完成 RPC 调用的超时控制。
 
 ## 8. 算法实现细节
 
@@ -724,7 +746,7 @@ local timer_co = skynet.fork(function()
 end)
 
 -- 取消定时器
-skynet.kill(timer_co)
+skynet.killthread(timer_co)
 ```
 
 ### 9.3 高精度需求
@@ -827,13 +849,13 @@ end)
    - 适合游戏服务器
 
 3. **高性能实现**
-   - 无锁化设计思路
+   - 自旋锁保护 + 短临界区
    - 批量处理
    - 缓存友好
 
 4. **与Skynet深度集成**
    - 消息机制结合
-   - 支持RPC超时
+   - 为业务层定制超时提供基础能力
    - 线程安全
 
 ### 设计亮点
