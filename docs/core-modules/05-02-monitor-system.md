@@ -430,8 +430,8 @@ skynet_getenv(const char *key) {
 | harbor | 节点ID | "1" |
 | bootstrap | 启动服务 | "snlua bootstrap" |
 | logpath | 日志目录 | "./logs" |
-| logger | 日志服务名 | "logger" |
-| logservice | 日志服务模块 | "snlua" |
+| logger | 日志文件路径（传给日志服务的参数，留空表示标准输出） | "./logs/skynet.log" |
+| logservice | 日志服务模块（默认使用内置C服务） | "logger" |
 
 ---
 
@@ -751,9 +751,9 @@ redirect_fds() {
    // ... 创建工作线程
    ```
 
-5. **启动logger服务**
-   - bootstrap服务启动logger
-   - logger服务开始接收日志消息
+5. **日志服务就绪**
+   - `skynet_start` 在创建线程之前调用 `skynet_context_new(logservice, logger)` 启动日志服务
+   - bootstrap 继续加载其余系统服务
 
 ### 6.3 运行时协作机制
 
@@ -893,8 +893,8 @@ error: A message from [ :00000001 ] to [ :00000002 ] maybe in an endless loop (v
 thread = 8
 harbor = 1
 bootstrap = "snlua bootstrap"
-logger = "logger"
-logservice = "snlua"
+logger = "./logs/skynet.log"    -- 传给日志服务的文件路径，nil 表示输出到 stdout
+logservice = "logger"           -- 使用内置 C 日志服务
 logpath = "./logs"
 ```
 

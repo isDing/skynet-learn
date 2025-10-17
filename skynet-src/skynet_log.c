@@ -48,6 +48,7 @@ log_socket(FILE * f, struct skynet_socket_message * message, size_t sz) {
 	fprintf(f, "[socket] %d %d %d ", message->type, message->id, message->ud);
 
 	if (message->buffer == NULL) {
+        // 内联数据
 		const char *buffer = (const char *)(message + 1);
 		sz -= sizeof(*message);
 		const char * eol = memchr(buffer, '\0', sz);
@@ -56,6 +57,7 @@ log_socket(FILE * f, struct skynet_socket_message * message, size_t sz) {
 		}
 		fprintf(f, "[%*s]", (int)sz, (const char *)buffer);
 	} else {
+        // 外部缓冲区
 		sz = message->ud;
 		log_blob(f, message->buffer, sz);
 	}
@@ -66,11 +68,11 @@ log_socket(FILE * f, struct skynet_socket_message * message, size_t sz) {
 void 
 skynet_log_output(FILE *f, uint32_t source, int type, int session, void * buffer, size_t sz) {
 	if (type == PTYPE_SOCKET) {
-		log_socket(f, buffer, sz);
+		log_socket(f, buffer, sz);  // 特殊处理socket消息
 	} else {
 		uint32_t ti = (uint32_t)skynet_now();
 		fprintf(f, ":%08x %d %d %u ", source, type, session, ti);
-		log_blob(f, buffer, sz);
+		log_blob(f, buffer, sz);    // 十六进制输出二进制数据
 		fprintf(f,"\n");
 		fflush(f);
 	}

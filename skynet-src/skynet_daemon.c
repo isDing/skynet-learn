@@ -22,6 +22,7 @@ check_pid(const char *pidfile) {
 		return 0;
 	}
 
+    // 检查进程是否存在
 	if (kill(pid, 0) && errno == ESRCH)
 		return 0;
 
@@ -43,6 +44,7 @@ write_pid(const char *pidfile) {
 		return 0;
 	}
 
+    // 获取排他锁
 	if (flock(fd, LOCK_EX|LOCK_NB) == -1) {
 		int n = fscanf(f, "%d", &pid);
 		fclose(f);
@@ -54,6 +56,7 @@ write_pid(const char *pidfile) {
 		return 0;
 	}
 
+    // 写入当前进程ID
 	pid = getpid();
 	if (!fprintf(f,"%d\n", pid)) {
 		fprintf(stderr, "Can't write pid.\n");
@@ -72,14 +75,17 @@ redirect_fds() {
 		perror("Unable to open /dev/null: ");
 		return -1;
 	}
+    // 重定向标准输入
 	if (dup2(nfd, 0) < 0) {
 		perror("Unable to dup2 stdin(0): ");
 		return -1;
 	}
+    // 重定向标准输出
 	if (dup2(nfd, 1) < 0) {
 		perror("Unable to dup2 stdout(1): ");
 		return -1;
 	}
+    // 重定向标准错误
 	if (dup2(nfd, 2) < 0) {
 		perror("Unable to dup2 stderr(2): ");
 		return -1;
@@ -92,6 +98,7 @@ redirect_fds() {
 
 int
 daemon_init(const char *pidfile) {
+    // 1. 检查是否已有实例在运行
 	int pid = check_pid(pidfile);
 
 	if (pid) {
@@ -99,20 +106,23 @@ daemon_init(const char *pidfile) {
 		return 1;
 	}
 
+    // 2. 创建守护进程
 #ifdef __APPLE__
 	fprintf(stderr, "'daemon' is deprecated: first deprecated in OS X 10.5 , use launchd instead.\n");
 #else
-	if (daemon(1,1)) {
+	if (daemon(1,1)) {  // 保留当前目录，保留标准IO
 		fprintf(stderr, "Can't daemonize.\n");
 		return 1;
 	}
 #endif
 
+    // 3. 写入PID文件
 	pid = write_pid(pidfile);
 	if (pid == 0) {
 		return 1;
 	}
 
+    // 4. 重定向标准IO
 	if (redirect_fds()) {
 		return 1;
 	}

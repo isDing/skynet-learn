@@ -9,11 +9,11 @@
 #include <assert.h>
 
 struct skynet_env {
-	struct spinlock lock;
-	lua_State *L;
+	struct spinlock lock;   // 自旋锁保护
+	lua_State *L;           // Lua状态机存储环境变量
 };
 
-static struct skynet_env *E = NULL;
+static struct skynet_env *E = NULL;  // 全局单例
 
 const char * 
 skynet_getenv(const char *key) {
@@ -36,7 +36,7 @@ skynet_setenv(const char *key, const char *value) {
 	
 	lua_State *L = E->L;
 	lua_getglobal(L, key);
-	assert(lua_isnil(L, -1));
+	assert(lua_isnil(L, -1));  // 确保不重复设置
 	lua_pop(L,1);
 	lua_pushstring(L,value);
 	lua_setglobal(L,key);

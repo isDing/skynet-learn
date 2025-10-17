@@ -13,6 +13,7 @@
 static int
 log_try_vasprintf(char **strp, const char *fmt, va_list ap) {
 	if (strcmp(fmt, "%*s") == 0) {
+        // 特殊处理Lua错误消息
 		// for `lerror` in lua-skynet.c
 		const int len = va_arg(ap, int);
 		const char *tmp = va_arg(ap, const char*);
@@ -20,6 +21,7 @@ log_try_vasprintf(char **strp, const char *fmt, va_list ap) {
 		return *strp != NULL ? len : -1;
 	}
 
+    // 常规格式化
 	char tmp[LOG_MESSAGE_SIZE];
 	int len = vsnprintf(tmp, LOG_MESSAGE_SIZE, fmt, ap);
 	if (len >= 0 && len < LOG_MESSAGE_SIZE) {
@@ -33,12 +35,14 @@ void
 skynet_error(struct skynet_context * context, const char *msg, ...) {
 	static uint32_t logger = 0;
 	if (logger == 0) {
+		// 查找logger服务
 		logger = skynet_handle_findname("logger");
 	}
 	if (logger == 0) {
-		return;
+		return;  // logger服务未启动
 	}
 
+    // 格式化错误消息
 	char *data = NULL;
 
 	va_list ap;
@@ -63,6 +67,7 @@ skynet_error(struct skynet_context * context, const char *msg, ...) {
 		}
 	}
 
+    // 构建消息
 	struct skynet_message smsg;
 	if (context == NULL) {
 		smsg.source = 0;
@@ -72,5 +77,6 @@ skynet_error(struct skynet_context * context, const char *msg, ...) {
 	smsg.session = 0;
 	smsg.data = data;
 	smsg.sz = len | ((size_t)PTYPE_TEXT << MESSAGE_TYPE_SHIFT);
+    // 发送到logger服务
 	skynet_context_push(logger, &smsg);
 }
