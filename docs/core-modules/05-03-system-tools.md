@@ -184,11 +184,11 @@ static inline int ATOM_CAS(atomic_int *ptr, int oval, int nval) {
 
 #### 3.1 实现策略
 
-提供三种自旋锁实现，根据平台和配置选择：
+根据编译配置提供三种分支：
 
-1. **原子标志实现**（默认）
-2. **pthread_mutex 实现**（可选）
-3. **优化的自旋锁**（x86_64 特定）
+1. **C11 原子版本（默认）**：依赖 `atomic_exchange_explicit`/`atomic_load_explicit`，在 x86_64 平台配合 `_mm_pause()` 缓解忙等。
+2. **GCC 原子内建版本**：当定义 `__STDC_NO_ATOMICS__` 时，退化到 `__sync_lock_test_and_set` 与 `__sync_lock_release`。
+3. **pthread 版本**：显式定义 `USE_PTHREAD_LOCK` 时改用 `pthread_mutex`，方便在调试或不允许忙等的场景下使用。
 
 #### 3.2 标准自旋锁实现
 
@@ -356,10 +356,10 @@ while (lock || !CAS(&lock, 0, 1)) {
 }
 ```
 
-#### 公平性改进
-- 使用 ticket lock 保证 FIFO
-- 避免线程饥饿
-- 减少锁护送
+#### 公平性注意事项
+- 当前实现为简化自旋锁，未内建 FIFO 公平策略。
+- 对需要公平性的场景，可自行换成 ticket lock 或在调用侧设计退避/优先级策略。
+- 配合 `spinlock_trylock` 做退避能降低长时间占用导致的锁护送。
 
 ### 3. 原子操作优化
 
@@ -384,17 +384,10 @@ free(ptr);
 ```
 
 #### 内存调试技巧
-```c
-// 编译时开启内存检查
-#define MEMORY_CHECK
-
-// 运行时查看内存使用
-skynet.memory()  -- Lua 接口
-dump_c_mem()     -- C 接口
-
-// 定位内存泄露
-skynet_debug_memory("checkpoint");
-```
+- 在需要的 C 模块中定义 `#define MEMORY_CHECK` 以开启额外检测。
+- Lua 层通过 `local memory = require "skynet.memory"; memory.dump()` 查看各服务内存。
+- C 层可调用 `dump_c_mem();` 输出统计。
+- 在自定义 C 服务中调用 `skynet_debug_memory("checkpoint");` 辅助定位泄露。
 
 ### 2. 锁使用指南
 

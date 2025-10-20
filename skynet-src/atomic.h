@@ -5,6 +5,8 @@
 #include <stdint.h>
 
 #ifdef __STDC_NO_ATOMICS__
+// 如果编译器/标准库不支持 C11 原子（如老旧 GCC），退回到 GCC 内建原子操作。
+// 这些宏以 __sync_* 为基础，语义简单粗暴但兼容性最好。
 
 #define ATOM_INT volatile int
 #define ATOM_POINTER volatile uintptr_t
@@ -24,6 +26,8 @@
 #define ATOM_FAND(ptr,n) __sync_fetch_and_and(ptr, n)
 
 #else
+// 默认分支：使用 C11 stdatomic（或 C++ std::atomic），具备更细粒度的内存序语义。
+// STD_ 宏用来在 C/C++ 之间复用同一份代码。
 
 #if defined (__cplusplus)
 #include <atomic>
@@ -45,6 +49,8 @@
 
 static inline int
 ATOM_CAS(STD_ atomic_int *ptr, int oval, int nval) {
+	// 这里使用弱 CAS，配合外层循环可获得较好的性能；
+	// 学习时注意 weak CAS 允许失败即便值未变化，需要循环重试。
 	return STD_ atomic_compare_exchange_weak(ptr, &(oval), nval);
 }
 
