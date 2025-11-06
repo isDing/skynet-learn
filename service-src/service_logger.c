@@ -7,10 +7,10 @@
 #include <time.h>
 
 struct logger {
-	FILE * handle;
-	char * filename;
-	uint32_t starttime;
-	int close;
+	FILE * handle;              // 当前写入目标（文件或 stdout）
+	char * filename;            // 当写入文件时保存路径
+	uint32_t starttime;         // 服务启动时间（用于格式化时间戳）
+	int close;                  // 是否需要在释放时关闭句柄
 };
 
 struct logger *
@@ -49,6 +49,7 @@ logger_cb(struct skynet_context * context, void *ud, int type, int session, uint
 	struct logger * inst = ud;
 	switch (type) {
 	case PTYPE_SYSTEM:
+        // 轮转：重新打开同一路径，追加写模式
 		if (inst->filename) {
 			inst->handle = freopen(inst->filename, "a", inst->handle);
 		}

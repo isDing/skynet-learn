@@ -36,18 +36,20 @@ struct snlua {
 ```
 snlua_create()
     ↓
-创建 Lua 状态机 (lua_newstate)
+lua_newstate + 绑定自定义分配器 lalloc
     ↓
-设置自定义内存分配器 (lalloc)
+snlua_init(ctx, args)
+    ├── 注册 launch_cb 作为服务回调
+    └── 通过 REG 获得自身句柄并发送首条 PTYPE_TAG_DONTCOPY 消息
     ↓
-launch_cb() [第一条消息触发]
+launch_cb()   // 接收首条消息（type=0, session=0）
     ↓
 init_cb()
-    ├── 加载标准库 (luaL_openlibs)
-    ├── 注册 profile 库
-    ├── 设置环境变量 (LUA_PATH, LUA_CPATH)
-    ├── 加载 loader.lua
-    └── 执行服务代码
+    ├── 暂停 GC、加载标准库 (luaL_openlibs)
+    ├── 注入 profile 库并替换 coroutine.resume/wrap
+    ├── 设置 LUA_PATH/LUA_CPATH/LUA_SERVICE 等环境变量
+    ├── 加载 lualoader（默认 ./lualib/loader.lua）
+    └── 执行具体 Lua 服务代码
 ```
 
 #### 1.4 内存管理机制
@@ -123,6 +125,7 @@ static int timing_resume(lua_State *L, int co_index, int n) {
 ```c
 // 信号处理
 void snlua_signal(struct snlua *l, int signal) {
+    skynet_error(l->ctx, "recv a signal %d", signal);
     if (signal == 0) {
         // 设置中断陷阱
         if (ATOM_LOAD(&l->trap) == 0) {
@@ -251,58 +254,30 @@ static void dispatch_message(struct gate *g, struct connection *c,
 
 #### 2.5 控制命令处理
 
-```c
-static void _ctrl(struct gate * g, const void * msg, int sz) {
-    // kick: 踢出连接
-    if (memcmp(command, "kick", i) == 0) {
-        int uid = strtol(command, NULL, 10);
-        int id = hashid_lookup(&g->hash, uid);
-        if (id >= 0) {
-            skynet_socket_close(ctx, uid);
-        }
-    }
-    
-    // forward: 设置转发目标
-    if (memcmp(command, "forward", i) == 0) {
-        // 解析参数：fd agent_handle client_handle
-        _forward_agent(g, id, agent_handle, client_handle);
-    }
-    
-    // broker: 设置 broker 服务
-    if (memcmp(command, "broker", i) == 0) {
-        g->broker = skynet_queryname(ctx, command);
-    }
-    
-    // start: 开始接收数据
-    if (memcmp(command, "start", i) == 0) {
-        int uid = strtol(command, NULL, 10);
-        skynet_socket_start(ctx, uid);
-    }
-    
-    // close: 关闭监听
-    if (memcmp(command, "close", i) == 0) {
-        if (g->listen_id >= 0) {
-            skynet_socket_close(ctx, g->listen_id);
-            g->listen_id = -1;
-        }
-    }
-}
-```
+`_ctrl` 负责解析 `PTYPE_TEXT` 控制指令，核心命令包括：
+
+- `kick <fd>`：根据 `hashid_lookup` 找到连接并关闭；未找到时忽略。
+- `forward <fd> :<agent> :<client>`：通过 `strsep` 拆出参数，调用 `_forward_agent` 设置后续数据包的转发目标。
+- `broker <name>`：用 `skynet_queryname` 将网关切换到 broker 模式。
+- `start <fd>`：只有当连接已记录在 `hashid` 中时才调用 `skynet_socket_start` 启动读写。
+- `close`：关闭监听 socket 并将 `listen_id` 重置为 `-1`。
+
+无法识别的命令会通过 `skynet_error` 记录，方便定位配置错误。
 
 ### 3. Logger 服务 (service_logger.c)
 
 #### 3.1 功能设计
 
-Logger 服务提供集中式的日志记录功能，支持日志文件管理、日志轮转和异步写入。
+Logger 服务提供集中式的日志记录功能，负责将 `PTYPE_TEXT` 文本落盘或输出到标准输出。写入流程为同步阻塞方式，同时支持通过 `PTYPE_SYSTEM` 消息触发重新打开文件，便于配合外部日志轮转。
 
 #### 3.2 核心结构
 
 ```c
 struct logger {
-    FILE * handle;              // 文件句柄
-    char * filename;            // 日志文件名
-    struct skynet_context * ctx;
-    int close;                  // 关闭标志
+    FILE * handle;              // 当前写入目标（文件或 stdout）
+    char * filename;            // 当写入文件时保存路径
+    uint32_t starttime;         // 服务启动时间（用于格式化时间戳）
+    int close;                  // 是否需要在释放时关闭句柄
 };
 ```
 
@@ -315,18 +290,18 @@ static int logger_cb(struct skynet_context * context, void *ud,
     struct logger * inst = ud;
     switch (type) {
     case PTYPE_SYSTEM:
-        // 系统消息：重新打开日志文件（日志轮转）
+        // 轮转：重新打开同一路径，追加写模式
         if (inst->filename) {
-            FILE *f = freopen(inst->filename, "a", inst->handle);
-            if (f == NULL) {
-                skynet_error(context, "Open log file %s failed", 
-                           inst->filename);
-            }
+            inst->handle = freopen(inst->filename, "a", inst->handle);
         }
         break;
     case PTYPE_TEXT:
-        // 文本日志：写入文件
-        fprintf(inst->handle, "[%08x] ", source);
+        if (inst->filename) {
+            char tmp[SIZETIMEFMT];
+            int csec = timestring(inst, tmp);
+            fprintf(inst->handle, "%s.%02d ", tmp, csec);
+        }
+        fprintf(inst->handle, "[:%08x] ", source);
         fwrite(msg, sz, 1, inst->handle);
         fprintf(inst->handle, "\n");
         fflush(inst->handle);
@@ -345,36 +320,93 @@ Harbor 服务负责处理跨节点通信，管理远程服务的消息转发和�
 #### 4.2 核心数据结构
 
 ```c
+struct remote_message_header {
+    uint32_t source;
+    uint32_t destination;   // 高 8 位为消息类型
+    uint32_t session;
+};
+
+struct harbor_msg {
+    struct remote_message_header header;
+    void * buffer;
+    size_t size;
+};
+
+struct harbor_msg_queue {
+    int size, head, tail;
+    struct harbor_msg * data;
+};
+
+struct keyvalue {
+    struct keyvalue * next;
+    char key[GLOBALNAME_LENGTH];
+    uint32_t hash;
+    uint32_t value;                // 远程服务句柄
+    struct harbor_msg_queue * queue; // 名称解析前的待发队列
+};
+
+struct hashmap {
+    struct keyvalue *node[HASH_SIZE];
+};
+
+struct slave {
+    int fd;
+    struct harbor_msg_queue *queue;
+    int status;            // STATUS_WAIT / STATUS_HANDSHAKE / STATUS_HEADER / STATUS_CONTENT / STATUS_DOWN
+    int length;
+    int read;
+    uint8_t size[4];
+    char * recv_buffer;
+};
+
 struct harbor {
     struct skynet_context *ctx;
-    int id;                     // Harbor ID
-    uint32_t slave;            // 从节点句柄
-    struct hashmap * map;      // 远程服务映射
-    struct queue * queue;      // 消息队列
+    int id;
+    uint32_t slave;              // 对应的 .cslave 句柄
+    struct hashmap * map;        // 全局名字缓存
+    struct slave s[REMOTE_MAX];  // 所有远程节点连接
 };
 ```
 
+`STATUS_*` 常量驱动收包状态机：握手阶段校验远端 Harbor ID，随后进入包头读取（4 字节大端长度）与包体读取；连接断开时释放队列并向 `watchdog`（即 `slave` 服务）报告。
+
 #### 4.3 消息转发机制
 
+`mainloop` 是 Harbor 的统一回调，处理三类消息：
+
 ```c
-static int harbor_cb(struct skynet_context * context, void *ud,
-                    int type, int session, uint32_t source, 
+static int mainloop(struct skynet_context * context, void * ud,
+                    int type, int session, uint32_t source,
                     const void * msg, size_t sz) {
     struct harbor * h = ud;
-    
-    // 判断目标地址
-    uint32_t destination = skynet_harbor_message_dest(msg);
-    uint32_t harbor_id = destination >> HANDLE_REMOTE_SHIFT;
-    
-    if (harbor_id == h->id) {
-        // 本地消息，直接处理
-        return local_send(h, source, destination, msg, sz, type);
-    } else {
-        // 远程消息，转发给对应的 slave
-        return remote_send(h, source, destination, msg, sz, type);
+    switch (type) {
+    case PTYPE_SOCKET:
+        // SKYNET_SOCKET_TYPE_DATA -> push_socket_data(h, message);
+        // SKYNET_SOCKET_TYPE_CLOSE/ERROR -> report_harbor_down
+        // SKYNET_SOCKET_TYPE_ACCEPT -> 完成握手并派发缓存队列
+        break;
+    case PTYPE_HARBOR:
+        harbor_command(h, msg, sz, session, source);   // N/S/A/Q 等控制指令
+        break;
+    case PTYPE_SYSTEM: {
+        const struct remote_message *rmsg = msg;
+        if (rmsg->destination.handle == 0)
+            return remote_send_name(h, source, rmsg->destination.name,
+                                    rmsg->type, session, rmsg->message, rmsg->sz);
+        return remote_send_handle(h, source, rmsg->destination.handle,
+                                  rmsg->type, session, rmsg->message, rmsg->sz);
     }
+    default:
+        // 未知类型：记录错误并回发 PTYPE_ERROR
+        break;
+    }
+    return 0;
 }
 ```
+
+- **本地落地**：当 `push_socket_data` 解包后发现目标属于本地 Harbor，会调用 `forward_local_messsage`，直接把 payload 交给目标服务（携带 `PTYPE_TAG_DONTCOPY`）。
+- **远程发送**：`remote_send_handle`/`remote_send_name` 在本地未命中句柄时，会把消息打包成 `remote_message_header + body`，通过 `send_remote` 写入对应 `slave` 的 fd；若连接未就绪则暂存于 `harbor_msg_queue`。
+- **名字绑定**：`harbor_command` 处理 `N name handle` 指令，建立哈希表映射并触发挂起队列派发。
 
 ## C 服务接口规范
 
@@ -429,35 +461,42 @@ void service_name_release(void *);
 void service_name_signal(void *, int);
 ```
 
+初始化过程中，模块通常会在 `*_init` 内调用：
+
+```c
+skynet_callback(ctx, instance, module_callback);
+```
+
+以便将消息循环挂接到 Skynet 内核。C 服务实现的业务逻辑基本都在该回调中完成。
+
 ## 内存管理
 
 ### 1. SNLua 内存控制
 
-```c
-// 内存限制设置
-lua_pushinteger(L, limit);
-lua_setfield(L, LUA_REGISTRYINDEX, "memlimit");
+Lua 层通过 `skynet.memlimit` 设置限制，真实实现位于 `lualib/skynet.lua`：
 
-// 内存报警机制
-#define MEMORY_WARNING_REPORT (1024 * 1024 * 32)  // 32MB
-
-if (l->mem > l->mem_report) {
-    l->mem_report *= 2;  // 指数增长
-    skynet_error(l->ctx, "Memory warning %.2f M", 
-                (float)l->mem / (1024 * 1024));
-}
+```lua
+function skynet.memlimit(bytes)
+    debug.getregistry().memlimit = bytes
+    skynet.memlimit = nil    -- 仅允许设置一次
+end
 ```
+
+`init_cb` 在加载完 `loader.lua` 后读取 `LUA_REGISTRYINDEX` 的 `memlimit` 字段，并将值写入 `snlua::mem_limit`，随后由 `lalloc` 在每次分配时做上限校验。内存报警由 `MEMORY_WARNING_REPORT (32MB)` 阈值驱动，每次触发翻倍，避免频繁输出。
 
 ### 2. Gate 消息池
 
 ```c
-// 消息池管理
-struct messagepool {
-    struct message_queue * freelist;
-    // 批量分配，减少内存碎片
+struct messagepool_list {
+    struct messagepool_list *next;
+    struct message pool[MESSAGEPOOL];
 };
 
-// 缓冲区管理
+struct messagepool {
+    struct messagepool_list * pool;
+    struct message * freelist;
+};
+
 struct databuffer {
     int header;
     int offset;
@@ -466,6 +505,8 @@ struct databuffer {
     struct message * tail;
 };
 ```
+
+`databuffer_push` 优先复用 `freelist` 中的 `struct message`，不足时才批量申请 `MESSAGEPOOL`（默认 1023）个节点，显著降低频繁 malloc 带来的碎片化。
 
 ## 性能优化
 

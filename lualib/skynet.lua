@@ -963,6 +963,7 @@ local function raw_dispatch_message(prototype, msg, sz, session, source)
 end
 
 function skynet.dispatch_message(...)
+	-- 1. 调用 raw_dispatch_message 处理消息
 	local succ, err = pcall(raw_dispatch_message,...)
 	while true do
 		if fork_queue.h > fork_queue.t then
@@ -1077,7 +1078,9 @@ function skynet.init_service(start)
 end
 
 function skynet.start(start_func)
+	-- 步骤1: 设置消息分发回调
 	c.callback(skynet.dispatch_message)
+	-- 步骤2: 创建一个 0 延迟的定时器来执行初始化
 	init_thread = skynet.timeout(0, function()
 		skynet.init_service(start_func)
 		init_thread = nil

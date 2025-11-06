@@ -66,10 +66,10 @@ signal_hook(lua_State *L, lua_Debug *ar) {
 	lua_getallocf(L, &ud);
 	struct snlua *l = (struct snlua *)ud;
 
-	lua_sethook (L, NULL, 0, 0);
+	lua_sethook (L, NULL, 0, 0);  // 移除 hook
 	if (ATOM_LOAD(&l->trap)) {
 		ATOM_STORE(&l->trap , 0);
-		luaL_error(L, "signal 0");
+		luaL_error(L, "signal 0");  // 触发 Lua 错误
 	}
 }
 
@@ -181,10 +181,12 @@ timing_total(lua_State *L, int co_index) {
 	return total_time;
 }
 
+// 带性能分析的协程恢复
 static int
 timing_resume(lua_State *L, int co_index, int n) {
 	lua_State *co = lua_tothread(L, co_index);
 	lua_Number start_time = 0;
+    // 记录开始时间
 	if (timing_enable(L, co_index, &start_time)) {
 		start_time = get_time();
 #ifdef DEBUG_LOG
@@ -196,8 +198,10 @@ timing_resume(lua_State *L, int co_index, int n) {
 		lua_rawset(L, lua_upvalueindex(1));	// set start time
 	}
 
+    // 恢复协程
 	int r = auxresume(L, co, n);
 
+    // 计算执行时间
 	if (timing_enable(L, co_index, &start_time)) {
 		double total_time = timing_total(L, co_index);
 		double diff = diff_time(start_time);
@@ -479,19 +483,23 @@ snlua_init(struct snlua *l, struct skynet_context *ctx, const char * args) {
 	return 0;
 }
 
+// 自定义内存分配器
 static void *
 lalloc(void * ud, void *ptr, size_t osize, size_t nsize) {
 	struct snlua *l = ud;
 	size_t mem = l->mem;
+    // 更新内存统计
 	l->mem += nsize;
 	if (ptr)
 		l->mem -= osize;
+    // 内存限制检查
 	if (l->mem_limit != 0 && l->mem > l->mem_limit) {
 		if (ptr == NULL || nsize > osize) {
-			l->mem = mem;
-			return NULL;
+			l->mem = mem;  // 回滚
+			return NULL;    // 分配失败
 		}
 	}
+    // 内存警告
 	if (l->mem > l->mem_report) {
 		l->mem_report *= 2;
 		skynet_error(l->ctx, "Memory warning %.2f M", (float)l->mem / (1024 * 1024));
@@ -517,19 +525,23 @@ snlua_release(struct snlua *l) {
 	skynet_free(l);
 }
 
+// 信号处理
 void
 snlua_signal(struct snlua *l, int signal) {
 	skynet_error(l->ctx, "recv a signal %d", signal);
 	if (signal == 0) {
+        // 设置中断陷阱
 		if (ATOM_LOAD(&l->trap) == 0) {
 			// only one thread can set trap ( l->trap 0->1 )
 			if (!ATOM_CAS(&l->trap, 0, 1))
 				return;
+            // 设置 Lua hook，每执行一条指令检查一次
 			lua_sethook (l->activeL, signal_hook, LUA_MASKCOUNT, 1);
 			// finish set ( l->trap 1 -> -1 )
 			ATOM_CAS(&l->trap, 1, -1);
 		}
 	} else if (signal == 1) {
+        // 查询内存使用
 		skynet_error(l->ctx, "Current Memory %.3fK", (float)l->mem / 1024);
 	}
 }

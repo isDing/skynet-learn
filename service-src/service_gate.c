@@ -12,26 +12,28 @@
 
 #define BACKLOG 128
 
+// 连接信息
 struct connection {
 	int id;	// skynet_socket id
-	uint32_t agent;
-	uint32_t client;
-	char remote_name[32];
-	struct databuffer buffer;
+    uint32_t agent;            // 代理服务句柄
+    uint32_t client;           // 客户端服务句柄
+    char remote_name[32];      // 远程地址
+    struct databuffer buffer;   // 数据缓冲区
 };
 
+// Gate 服务结构
 struct gate {
 	struct skynet_context *ctx;
-	int listen_id;
-	uint32_t watchdog;
-	uint32_t broker;
-	int client_tag;
-	int header_size;
-	int max_connection;
-	struct hashid hash;
-	struct connection *conn;
+	int listen_id;              // 监听 socket
+	uint32_t watchdog;          // watchdog 服务句柄
+	uint32_t broker;            // broker 服务句柄
+	int client_tag;             // 消息类型标记
+	int header_size;            // 包头大小
+	int max_connection;         // 最大连接数
+	struct hashid hash;         // 连接 ID 映射
+	struct connection *conn;    // 连接数组
 	// todo: save message pool ptr for release
-	struct messagepool mp;
+	struct messagepool mp;      // 消息池
 };
 
 struct gate *
@@ -173,17 +175,21 @@ _forward(struct gate *g, struct connection * c, int size) {
 		// socket error
 		return;
 	}
+    // broker 模式：转发给 broker 服务
 	if (g->broker) {
 		void * temp = skynet_malloc(size);
 		databuffer_read(&c->buffer,&g->mp,(char *)temp, size);
 		skynet_send(ctx, 0, g->broker, g->client_tag | PTYPE_TAG_DONTCOPY, fd, temp, size);
 		return;
 	}
+    // agent 模式：转发给指定 agent
 	if (c->agent) {
 		void * temp = skynet_malloc(size);
 		databuffer_read(&c->buffer,&g->mp,(char *)temp, size);
 		skynet_send(ctx, c->client, c->agent, g->client_tag | PTYPE_TAG_DONTCOPY, fd , temp, size);
-	} else if (g->watchdog) {
+	}
+    // watchdog 模式：转发给 watchdog
+	else if (g->watchdog) {
 		char * tmp = skynet_malloc(size + 32);
 		int n = snprintf(tmp,32,"%d data ",c->id);
 		databuffer_read(&c->buffer,&g->mp,tmp+n,size);
@@ -193,11 +199,14 @@ _forward(struct gate *g, struct connection * c, int size) {
 
 static void
 dispatch_message(struct gate *g, struct connection *c, int id, void * data, int sz) {
+	// 将数据推入缓冲区
 	databuffer_push(&c->buffer,&g->mp, data, sz);
+    // 循环处理完整的数据包
 	for (;;) {
+        // 读取包头，获取包大小
 		int size = databuffer_readheader(&c->buffer, &g->mp, g->header_size);
 		if (size < 0) {
-			return;
+			return;  // 数据不足
 		} else if (size > 0) {
 			if (size >= 0x1000000) {
 				struct skynet_context * ctx = g->ctx;
@@ -206,7 +215,7 @@ dispatch_message(struct gate *g, struct connection *c, int id, void * data, int 
 				skynet_error(ctx, "Recv socket message > 16M");
 				return;
 			} else {
-				_forward(g, c, size);
+				_forward(g, c, size);  // 转发完整包
 				databuffer_reset(&c->buffer);
 			}
 		}
