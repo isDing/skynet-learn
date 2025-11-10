@@ -1,3 +1,8 @@
+-- 说明：
+--  gate 是通用 TCP 接入服务：
+--   - 监听端口并接入客户端
+--   - 默认将收到的数据以字符串形态发送给 watchdog（lua 消息）
+--   - 通过 CMD.forward 将 fd 绑定到某个 agent，之后数据走 client 协议重定向到 agent
 local skynet = require "skynet"
 local gateserver = require "snax.gateserver"
 
@@ -18,6 +23,7 @@ end
 
 function handler.message(fd, msg, sz)
 	-- recv a package, forward it
+	-- 收到数据包：转发到 agent（若已 forward），否则以字符串通知 watchdog
 	local c = connection[fd]
 	local agent = c.agent
 	if agent then
@@ -71,6 +77,7 @@ end
 local CMD = {}
 
 function CMD.forward(source, fd, client, address)
+	-- 绑定 fd 到某个 agent，并记录 client 源地址（用于重定向）
 	local c = assert(connection[fd])
 	unforward(c)
 	c.client = client or 0
@@ -79,12 +86,14 @@ function CMD.forward(source, fd, client, address)
 end
 
 function CMD.accept(source, fd)
+	-- 将 fd 从转发状态退回，仅作为普通连接开放读取
 	local c = assert(connection[fd])
 	unforward(c)
 	gateserver.openclient(fd)
 end
 
 function CMD.kick(source, fd)
+	-- 主动断开某个 fd
 	gateserver.closeclient(fd)
 end
 

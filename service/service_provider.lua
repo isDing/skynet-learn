@@ -1,7 +1,13 @@
+-- 说明：
+--  service_provider 是命名服务的后端：
+--   - 输入: LAUNCH/QUERY/CLOSE/TEST 等来自 skynet.service 封装的请求
+--   - 负责：串行化创建某个 name 的服务（仅一次），其余并发请求排队等待
+--   - 记录：启动参数/时间/状态（booting/queue）
 local skynet = require "skynet"
 
 local provider = {}
 
+-- 懒加载：当 svr[name] 不存在时创建记录表
 local function new_service(svr, name)
 	local s = {}
 	svr[name] = s
@@ -12,6 +18,7 @@ end
 local svr = setmetatable({}, { __index = new_service })
 
 
+-- 查询已有服务地址：若启动中则压入队列，等待 launch 完成
 function provider.query(name)
 	local s = svr[name]
 	if s.queue then
@@ -25,6 +32,7 @@ function provider.query(name)
 	end
 end
 
+-- 完成 service_cell 初始化并记录启动信息
 local function boot(addr, name, code, ...)
 	local s = svr[name]
 	skynet.call(addr, "lua", "init", code, ...)
@@ -39,6 +47,7 @@ local function boot(addr, name, code, ...)
 	s.time = skynet.time()
 end
 
+-- 启动服务（若未启动）：已启动则返回地址；并发调用排队等待
 function provider.launch(name, code, ...)
 	local s = svr[name]
 	if s.address then
@@ -78,6 +87,7 @@ function provider.launch(name, code, ...)
 	end
 end
 
+-- 检查状态：返回地址 / booting / 抛错 / nil
 function provider.test(name)
 	local s = svr[name]
 	if s.booting then
@@ -91,6 +101,7 @@ function provider.test(name)
 	end
 end
 
+-- 关闭并清除记录（返回已关闭的地址）
 function provider.close(name)
 	local s = svr[name]
 	if not s or s.booting then

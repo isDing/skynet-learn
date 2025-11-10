@@ -1,3 +1,8 @@
+-- 说明：
+--  clusteragent 运行在 clusterd 之下，负责处理来自远端节点的请求：
+--   - 使用 PTYPE_CLIENT 协议从 gate 转发上来的数据
+--   - 解包 cluster 请求（可能为分片），支持 trace
+--   - 调用本地服务并打包响应回远端 fd
 local skynet = require "skynet"
 local socket = require "skynet.socket"
 local cluster = require "skynet.cluster.core"
@@ -12,6 +17,7 @@ local large_request = {}
 local inquery_name = {}
 local register_name
 
+-- 延迟查询 register_name：缓存 miss 时向 clusterd.queryname 请求
 local register_name_mt = { __index =
 	function(self, name)
 		local waitco = inquery_name[name]
@@ -44,6 +50,10 @@ new_register_name()
 
 local tracetag
 
+-- 处理来自远端的请求：
+--  - addr==0 表示查询名字
+--  - is_push 表示不返回响应
+--  - 支持大请求分片（padding）与 trace 标签带入
 local function dispatch_request(_,_,addr, session, msg, sz, padding, is_push)
 	ignoreret()	-- session is fd, don't call skynet.ret
 	if session == nil then
@@ -132,6 +142,8 @@ skynet.start(function()
 	}
 	-- fd can write, but don't read fd, the data package will forward from gate though client protocol.
 	-- forward may fail, see https://github.com/cloudwu/skynet/issues/1958
+	-- fd 只负责写：数据包读取由 gate 接管并通过 client 协议转发
+	-- 转发可能失败（参阅相关 issue），这里尽量简化职责
 	pcall(skynet.call,gate, "lua", "forward", fd)
 
 	skynet.dispatch("lua", function(_,source, cmd, ...)

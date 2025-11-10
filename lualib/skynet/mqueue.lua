@@ -1,4 +1,8 @@
 -- This is a deprecated module, use skynet.queue instead.
+-- 说明：
+--  本模块已废弃，请使用 skynet.queue 实现串行化临界区。
+--  mqueue 曾通过注册 PTYPE_QUEUE(8) 的协议在用户空间实现消息队列，
+--  但该机制已被更安全可靠的 skynet.queue 取代。
 
 local skynet = require "skynet"
 local c = require "skynet.core"
@@ -8,6 +12,7 @@ local init_once
 local thread_id
 local message_queue = {}
 
+-- 注册已废弃的 queue 协议，仅用于兼容历史代码
 skynet.register_protocol {
 	name = "queue",
 	-- please read skynet.h for magic number 8

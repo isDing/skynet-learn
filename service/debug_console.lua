@@ -1,3 +1,8 @@
+-- 说明：
+--  debug_console 提供 TCP/HTTP 的命令行调试控制台：
+--   - 支持 list/stat/mem/gc/start/snax/clearcache/service/task/uniqtask/inject/logon/logoff/log/…
+--   - 支持 http GET/POST 方式提交命令
+--   - 通过 `skynet.debug` 协议与目标服务交互（见 COMMAND/COMMANDX）
 local skynet = require "skynet"
 local codecache = require "skynet.codecache"
 local core = require "skynet.core"
@@ -89,6 +94,7 @@ local function docmd(cmdline, print, fd)
 	end
 end
 
+-- 主循环：支持文本命令与 HTTP GET/POST
 local function console_main_loop(stdin, print, addr)
 	print("Welcome to skynet console")
 	skynet.error(addr, "connected")

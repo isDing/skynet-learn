@@ -1,3 +1,9 @@
+-- 说明：
+--  snaxd 是 SNAX 模式的运行容器：
+--   - 加载 snax 接口定义（accept/response/system），并设置搜索路径
+--   - 处理 system 指令（init/exit/hotfix/profile）与业务方法
+--   - 为业务方法做 profile 统计（次数/耗时）
+--   - 可通过 snax.enablecluster() 开启 "lua" 协议分发以支持 cluster
 local skynet = require "skynet"
 local c = require "skynet.core"
 local snax_interface = require "snax.interface"
@@ -16,6 +22,7 @@ SERVICE_PATH = snax_path
 
 local profile_table = {}
 
+-- 更新方法统计：调用次数与累计时间
 local function update_stat(name, ti)
 	local t = profile_table[name]
 	if t == nil then
@@ -32,6 +39,7 @@ local function return_f(f, ...)
 	return skynet.ret(skynet.pack(f(...)))
 end
 
+-- 包装业务调用：按 accept/response 区分是否返回，记录 profile
 local function timing( method, ... )
 	local err, msg
 	profile.start()
@@ -83,7 +91,7 @@ skynet.start(function()
 	end
 	skynet.dispatch("snax", dispatcher)
 
-	-- set lua dispatcher
+	-- set lua dispatcher（用于集群）：开启后同一 dispatcher 处理 lua 协议
 	function snax.enablecluster()
 		skynet.dispatch("lua", dispatcher)
 	end

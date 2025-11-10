@@ -1,3 +1,9 @@
+-- 说明：
+--  .service 管理器：提供 LAUNCH/QUERY/GLAUNCH/GQUERY 等接口，集中管理命名服务。
+--  特点：
+--   - 并发请求同名服务会排队（waitfor），仅首个触发真正创建
+--   - 支持 snaxd 与普通服务（snlua）的启动与查询
+--   - 在 standalone 模式下，还提供全局管理（SERVICE）
 local skynet = require "skynet"
 require "skynet.manager"	-- import skynet.register
 local snax = require "skynet.snax"
@@ -5,6 +11,7 @@ local snax = require "skynet.snax"
 local cmd = {}
 local service = {}
 
+-- 实际启动动作：调用 func，记录成功的地址或失败原因，并唤醒等待队列
 local function request(name, func, ...)
 	local ok, handle = pcall(func, ...)
 	local s = service[name]
@@ -26,6 +33,9 @@ local function request(name, func, ...)
 	end
 end
 
+-- 等待 name 对应的地址：
+--  - 第一次带 func 调用触发启动，其余并发请求等待
+--  - 若之前失败，直接抛错（字符串）
 local function waitfor(name , func, ...)
 	local s = service[name]
 	if type(s) == "number" then
@@ -67,6 +77,7 @@ local function waitfor(name , func, ...)
 	return s
 end
 
+-- @name -> 去掉 '@' 的真实名，其它情况返回原始字符串
 local function read_name(service_name)
 	if string.byte(service_name) == 64 then -- '@'
 		return string.sub(service_name , 2)
@@ -76,6 +87,7 @@ local function read_name(service_name)
 end
 
 function cmd.LAUNCH(service_name, subname, ...)
+    -- 启动服务或 snax：按 @name 判断是否全局/是否 snaxd
 	local realname = read_name(service_name)
 
 	if realname == "snaxd" then
@@ -86,6 +98,7 @@ function cmd.LAUNCH(service_name, subname, ...)
 end
 
 function cmd.QUERY(service_name, subname)
+    -- 查询服务或 snax：同上逻辑
 	local realname = read_name(service_name)
 
 	if realname == "snaxd" then
@@ -96,6 +109,7 @@ function cmd.QUERY(service_name, subname)
 end
 
 local function list_service()
+    -- 生成服务列表：已就绪地址/错误文本/启动中队列详情
 	local result = {}
 	for k,v in pairs(service) do
 		if type(v) == "string" then
@@ -131,6 +145,7 @@ end
 
 
 local function register_global()
+    -- standalone 模式下作为全局服务管理者
 	function cmd.GLAUNCH(name, ...)
 		local global_name = "@" .. name
 		return cmd.LAUNCH(global_name, ...)
@@ -156,6 +171,7 @@ local function register_global()
 	end
 
 	function cmd.LIST()
+        -- 汇总其它 service_mgr 的 LIST 与本地 LIST
 		local result = {}
 		for k in pairs(mgr) do
 			pcall(add_list, result, k)
@@ -169,6 +185,7 @@ local function register_global()
 end
 
 local function register_local()
+    -- 非 standalone 模式：转发到远端 global SERVICE
 	local function waitfor_remote(cmd, name, ...)
 		local global_name = "@" .. name
 		local local_name

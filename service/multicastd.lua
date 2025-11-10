@@ -1,3 +1,9 @@
+-- 说明：
+--  multicastd 是多播通道的中心服务：
+--   - 为本地节点分配通道 id（低 8 位为 harbor_id）
+--   - 维护通道的本地订阅者集合与远端节点订阅集合
+--   - 转发发布消息到本地订阅者与远端节点
+--   - 与 datacenter 协作公布本节点地址（供其他节点路由）
 local skynet = require "skynet"
 local mc = require "skynet.multicast.core"
 local datacenter = require "skynet.datacenter"
@@ -11,6 +17,7 @@ local channel_remote = {}
 local channel_id = harbor_id
 local NORET = {}
 
+-- 延迟读取某个 harbor 节点的地址（由 datacenter 提供）
 local function get_address(t, id)
 	local v = assert(datacenter.get("multicast", id))
 	t[id] = v
@@ -20,6 +27,7 @@ end
 local node_address = setmetatable({}, { __index = get_address })
 
 -- new LOCAL channel , The low 8bit is the same with harbor_id
+-- 分配新的本地通道 id
 function command.NEW()
 	while channel[channel_id] do
 		channel_id = mc.nextid(channel_id)
@@ -32,6 +40,7 @@ function command.NEW()
 end
 
 -- MUST call by the owner node of channel, delete a remote channel
+-- 由通道拥有者调用：删除远端引用（远端节点确认删除）
 function command.DELR(source, c)
 	channel[c] = nil
 	channel_n[c] = nil
@@ -40,6 +49,7 @@ end
 
 -- delete a channel, if the channel is remote, forward the command to the owner node
 -- otherwise, delete the channel, and call all the remote node, DELR
+-- 删除通道：若为远端通道（非本节点拥有），转发给拥有节点；否则本地删除并通知远端 USUBR
 function command.DEL(source, c)
 	local node = c % 256
 	if node ~= harbor_id then
@@ -59,12 +69,16 @@ function command.DEL(source, c)
 end
 
 -- forward multicast message to a node (channel id use the session field)
+-- 将消息转发到远端节点（以 session 字段承载 channel）
 local function remote_publish(node, channel, source, ...)
 	skynet.redirect(node_address[node], source, "multicast", channel, ...)
 end
 
 -- publish a message, for local node, use the message pointer (call mc.bind to add the reference)
 -- for remote node, call remote_publish. (call mc.unpack and skynet.tostring to convert message pointer to string)
+-- 在本地发布消息：
+--  - 远端订阅者：需解包并复制为字符串，再 remote_publish
+--  - 本地订阅者：复制一份字符串消息，按订阅者数进行 mc.bind 引用计数
 local function publish(c , source, pack, size)
 	local remote = channel_remote[c]
 	if remote then
@@ -105,6 +119,7 @@ skynet.register_protocol {
 
 -- publish a message, if the caller is remote, forward the message to the owner node (by remote_publish)
 -- If the caller is local, call publish
+-- 发布接口：来自远端则转发，来自本地则直接发布
 function command.PUB(source, c, pack, size)
 	assert(skynet.harbor(source) == harbor_id)
 	local node = c % 256
@@ -120,6 +135,7 @@ end
 -- MUST call by channel owner node (assert source is not local and channel is create by self)
 -- If channel is not exist, return true
 -- Else set channel_remote[channel] true
+-- 由远端节点调用，订阅本地通道 c
 function command.SUBR(source, c)
 	local node = skynet.harbor(source)
 	if not channel[c] then
@@ -137,6 +153,7 @@ end
 
 -- the service (source) subscribe a channel
 -- If the channel is remote, node subscribe it by send a SUBR to the owner .
+-- 本地服务订阅通道：必要时向拥有节点发送 SUBR
 function command.SUB(source, c)
 	local node = c % 256
 	if node ~= harbor_id then
@@ -160,6 +177,7 @@ function command.SUB(source, c)
 end
 
 -- MUST call by a node, unsubscribe a channel
+-- 由远端节点调用，取消订阅本地通道 c
 function command.USUBR(source, c)
 	local node = skynet.harbor(source)
 	assert(node ~= harbor_id)
@@ -169,6 +187,7 @@ function command.USUBR(source, c)
 end
 
 -- Unsubscribe a channel, if the subscriber is empty and the channel is remote, send USUBR to the channel owner
+-- 本地服务取消订阅：若为远端通道且本地订阅为空，通知拥有节点 USUBR
 function command.USUB(source, c)
 	local group = assert(channel[c])
 	if group[source] then
@@ -199,4 +218,3 @@ skynet.start(function()
 	local id = skynet.harbor(self)
 	assert(datacenter.set("multicast", id, self) == nil)
 end)
-

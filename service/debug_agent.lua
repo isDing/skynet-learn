@@ -1,3 +1,9 @@
+-- 说明：
+--  debug_agent 是 debug_console 与目标服务之间的“调试通道代理”：
+--   - start(address, fd)：在目标服务上触发 REMOTEDEBUG，建立双向通道
+--   - cmd(cmdline)：向目标服务写入调试命令
+--   - ping()：探活
+--  创建完成后本服务立即退出（通道由目标服务持有）。
 local skynet = require "skynet"
 local debugchannel = require "skynet.debugchannel"
 

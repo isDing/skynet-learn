@@ -1,3 +1,8 @@
+-- 说明：
+--  sharetable 提供“结构共享”的只读表：
+--   - 通过底层共享内存（matrix）实现多进程共享，减少内存占用
+--   - 支持按文件/字符串/表加载，按文件名查询与版本管理
+--   - 客户端 clone 得到的是轻量代理，不持有数据副本
 local skynet = require "skynet"
 local service = require "skynet.service"
 local core = require "skynet.sharetable.core"
@@ -495,4 +500,3 @@ function sharetable.update(...)
 end
 
 return sharetable
-

@@ -1,4 +1,10 @@
 -- You should use this module (skynet.coroutine) instead of origin lua coroutine in skynet framework
+-- 说明：
+--  skynet.coroutine 提供对原生 coroutine 的包装，使其与 Skynet 的调度/挂起机制兼容：
+--   - skynetco.create/resume/yield/close 与框架 suspend/dispatch 互操作
+--   - 正确识别“阻塞于框架”的状态（status 返回 blocked）
+--   - 防止 resume 非 skynet 协程或被框架挂起的协程
+--  推荐在框架内使用本模块而非原生 coroutine。
 
 local coroutine = coroutine
 -- origin lua coroutine module
@@ -20,6 +26,7 @@ local skynet_coroutines = setmetatable({}, { __mode = "kv" })
 -- false : skynet suspend
 -- nil : exit
 
+-- 创建一个 skynet 协程，并标记在 skynet_coroutines 中
 function skynetco.create(f)
 	local co = coroutine.create(f)
 	-- mark co as a skynet coroutine
@@ -56,6 +63,9 @@ do -- begin skynetco.resume
 	-- record the root of coroutine caller (It should be a skynet thread)
 	local coroutine_caller = setmetatable({} , { __mode = "kv" })
 
+	-- 恢复协程：
+	--  - 拒绝恢复已被框架挂起/非 skynet 的协程
+	--  - 处理 USER/SUSPEND 等框架消息，正确返回/递归挂起
 	function skynetco.resume(co, ...)
 		local co_status = skynet_coroutines[co]
 		if not co_status then
@@ -87,6 +97,7 @@ do -- begin skynetco.resume
 
 end -- end of skynetco.resume
 
+-- 返回更细化的状态：被框架挂起的协程返回 "blocked"
 function skynetco.status(co)
 	local status = coroutine_status(co)
 	if status == "suspended" then
@@ -100,6 +111,7 @@ function skynetco.status(co)
 	end
 end
 
+-- 主动让出执行权（向上抛出 USER），由上一层 skynet.resume 驱动
 function skynetco.yield(...)
 	return coroutine_yield("USER", ...)
 end
@@ -114,6 +126,7 @@ do -- begin skynetco.wrap
 		end
 	end
 
+-- 包装一个函数为“可重入调用”的包装器，内部用 skynetco.resume 驱动
 function skynetco.wrap(f)
 	local co = skynetco.create(function(...)
 		return f(...)
@@ -125,6 +138,7 @@ end
 
 end	-- end of skynetco.wrap
 
+-- 关闭协程（并在表中去标记）
 function skynetco.close(co)
 	skynet_coroutines[co] = nil
 	return coroutine_close(co)

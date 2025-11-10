@@ -1,3 +1,8 @@
+-- 说明：
+--  sharedatad 统一管理 sharedata 的多版本对象：
+--   - new/delete/query/confirm/update/monitor
+--   - 通过 host.incref/decref 控制对象生命周期
+--   - 支持热更新：update 生成新版本，并通过 monitor 通知订阅者
 local skynet = require "skynet"
 local sharedata = require "skynet.sharedata.corelib"
 local table = table
@@ -10,6 +15,7 @@ local pool_count = {}
 local objmap = {}
 local collect_tick = 10
 
+-- 创建一个新的共享对象版本
 local function newobj(name, tbl)
 	assert(pool[name] == nil)
 	local cobj = sharedata.host.new(tbl)
@@ -20,12 +26,14 @@ local function newobj(name, tbl)
 	pool_count[name] = { n = 0, threshold = 16 }
 end
 
+-- 触发 1 分钟后的垃圾回收周期加速
 local function collect1min()
 	if collect_tick > 1 then
 		collect_tick = 1
 	end
 end
 
+-- 后台 GC：每分钟检查一次，累计 10 分钟触发一次全面回收
 local function collectobj()
 	while true do
 		skynet.sleep(60*100)	-- sleep 1min
@@ -50,6 +58,7 @@ local CMD = {}
 
 local env_mt = { __index = _ENV }
 
+-- 新建对象：支持 table / string(加载文件或 chunk) / nil
 function CMD.new(name, t, ...)
 	local dt = type(t)
 	local value
@@ -76,6 +85,7 @@ function CMD.new(name, t, ...)
 	newobj(name, value)
 end
 
+-- 删除对象：将对象标记为待回收，并唤醒监控者（返回 true）
 function CMD.delete(name)
 	local v = assert(pool[name])
 	pool[name] = nil
@@ -88,6 +98,7 @@ function CMD.delete(name)
 	end
 end
 
+-- 查询对象：增加引用计数并返回 C 对象指针
 function CMD.query(name)
 	local v = assert(pool[name], name)
 	local obj = v.obj
@@ -95,6 +106,7 @@ function CMD.query(name)
 	return v.obj
 end
 
+-- 客户端确认已使用完该对象指针（减少引用计数）
 function CMD.confirm(cobj)
 	if objmap[cobj] then
 		sharedata.host.decref(cobj)
@@ -102,6 +114,7 @@ function CMD.confirm(cobj)
 	return NORET
 end
 
+-- 更新对象：生成新版本，并通知所有监控协程（monitor）
 function CMD.update(name, t, ...)
 	local v = pool[name]
 	local watch, oldcobj
@@ -125,6 +138,7 @@ function CMD.update(name, t, ...)
 	collect1min()	-- collect in 1 min
 end
 
+-- 清理已失效的监控 response 闭包
 local function check_watch(queue)
 	local n = 0
 	for k,response in pairs(queue) do
@@ -136,6 +150,7 @@ local function check_watch(queue)
 	return n
 end
 
+-- 订阅对象变更：若 obj 不是最新则立即返回新对象，否则挂起等待 update 通知
 function CMD.monitor(name, obj)
 	local v = assert(pool[name])
 	if obj ~= v.obj then
@@ -165,4 +180,3 @@ skynet.start(function()
 		end
 	end)
 end)
-

@@ -1,3 +1,8 @@
+-- 说明：
+--  clusterd 是集群管理服务：
+--   - 维护 node->address 映射与 sender 的生命周期
+--   - 提供 sender/proxy/listen/register/queryname 等接口
+--   - 监听 socket 连接，接入 clusteragent 为每个 fd 提供协议处理
 local skynet = require "skynet"
 require "skynet.manager"
 local cluster = require "skynet.cluster.core"
@@ -12,6 +17,9 @@ local nodename = cluster.nodename()
 
 local connecting = {}
 
+-- 按需建立/切换到 node 的 sender：
+--  - 支持等待 node 地址解析（config.nowaiting 可跳过）
+--  - changenode(host,port|false) 切换/关闭 sender
 local function open_channel(t, key)
 	local ct = connecting[key]
 	if ct then
@@ -68,6 +76,7 @@ local function open_channel(t, key)
 			succ = true
 		else
 			-- trun off the sender
+			-- 关闭 sender（待下一次 changenode 重连）
 			succ, err = pcall(skynet.call, c, "lua", "changenode", false)
                         if succ then --trun off failed, wait next index todo turn off
                                 node_sender_closed[key] = true
@@ -89,6 +98,7 @@ end
 
 local node_channel = setmetatable({}, { __index = open_channel })
 
+-- 载入配置：支持从文件（skynet.getenv "cluster"）或传入表重载
 local function loadconfig(tmp)
 	if tmp == nil then
 		tmp = {}
@@ -142,6 +152,7 @@ function command.reload(source, config)
 	skynet.ret(skynet.pack(nil))
 end
 
+-- 打开监听：用于接收其它节点连接
 function command.listen(source, addr, port, maxclient)
 	local gate = skynet.newservice("gate")
 	if port == nil then
@@ -157,6 +168,7 @@ function command.listen(source, addr, port, maxclient)
 	end
 end
 
+-- 返回某个 node 的 sender（必要时触发连接）
 function command.sender(source, node)
 	skynet.ret(skynet.pack(node_channel[node]))
 end
@@ -167,6 +179,7 @@ end
 
 local proxy = {}
 
+-- 返回 node.name 的 clusterproxy 地址（作为本地代理）
 function command.proxy(source, node, name)
 	if name == nil then
 		node, name = node:match "^([^@.]+)([@.].+)"
@@ -200,6 +213,7 @@ local function clearnamecache()
 	end
 end
 
+-- 本地注册名，供远端查询（支持地址变更通知）
 function command.register(source, name, addr)
 	assert(register_name[name] == nil)
 	addr = addr or source
@@ -214,6 +228,7 @@ function command.register(source, name, addr)
 	skynet.error(string.format("Register [%s] :%08x", name, addr))
 end
 
+-- 取消注册名
 function command.unregister(_, name)
 	if not register_name[name] then
 		return skynet.ret(nil)
@@ -226,10 +241,12 @@ function command.unregister(_, name)
 	skynet.error(string.format("Unregister [%s] :%08x", name, addr))
 end
 
+-- 查询注册名
 function command.queryname(source, name)
 	skynet.ret(skynet.pack(register_name[name]))
 end
 
+-- 处理来自 gate 的 socket 事件：open/error/close
 function command.socket(source, subcmd, fd, msg)
 	if subcmd == "open" then
 		skynet.error(string.format("socket accept from %s", msg))

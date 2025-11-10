@@ -1,3 +1,8 @@
+-- 说明：
+--  clusterproxy 作为远端服务的本地“代理”：
+--   - 将本地收到的 lua/snax 请求统一转为 system 协议，交由 clusterd 的 sender 转发
+--   - forward_map 映射响应协议，避免释放 response 数据
+--   - 通过 skynet.forward_type 注入映射关系
 local skynet = require "skynet"
 local cluster = require "skynet.cluster"
 require "skynet.manager"	-- inject skynet.forward_type

@@ -52,47 +52,33 @@ local protocol = {
 
 ### 3. 内置协议注册
 
+核心框架（`lualib/skynet.lua`）仅注册以下协议：
+
 ```lua
 do
     local REG = skynet.register_protocol
-    
-    -- Lua 协议（最常用）
-    REG {
-        name = "lua",
-        id = skynet.PTYPE_LUA,
-        pack = skynet.pack,
-        unpack = skynet.unpack,
-    }
-    
-    -- 响应协议（内部使用）
-    REG {
-        name = "response",
-        id = skynet.PTYPE_RESPONSE,
-    }
-    
-    -- 错误协议
-    REG {
-        name = "error",
-        id = skynet.PTYPE_ERROR,
-        unpack = function(...) return ... end,
-        dispatch = _error_dispatch,
-    }
-    
-    -- 系统协议
-    REG {
-        name = "system",
-        id = skynet.PTYPE_SYSTEM,
-        unpack = function(...) return ... end,
-    }
-    
-    -- Socket 协议
-    REG {
-        name = "socket",
-        id = skynet.PTYPE_SOCKET,
-        unpack = skynet.tostring,
-    }
+
+    REG { name = "lua", id = skynet.PTYPE_LUA,
+          pack = skynet.pack, unpack = skynet.unpack }
+
+    REG { name = "response", id = skynet.PTYPE_RESPONSE }
+
+    REG { name = "error", id = skynet.PTYPE_ERROR,
+          unpack = function(...) return ... end,
+          dispatch = _error_dispatch }
 end
 ```
+
+其他常用协议在各自模块内注册（非 `skynet.lua`）：
+- `socket`：见 `lualib/skynet/socket.lua`，使用 `driver.unpack`，并分发至 `socket_message`。
+- `debug`：见 `lualib/skynet/debug.lua`，用于远程调试与诊断。
+- `snax`：见 `lualib/skynet/snax.lua`。
+- `PTYPE_SYSTEM`：保留为系统用途，Lua 层默认不注册对应协议类。
+
+协议注册位置索引（便于交叉阅读）：
+- `lualib/skynet/socket.lua:212` 注册 `socket` 协议（`unpack = driver.unpack`）。
+- `lualib/skynet/debug.lua:94` 注册 `debug` 协议（调试命令分发）。
+- `lualib/skynet/snax.lua:10` 注册 `snax` 协议（snax 接口）。
 
 ## 消息分发机制
 
@@ -471,6 +457,59 @@ function skynet.harbor(addr)
 end
 ```
 
+### 3. 服务命名与管理扩展（skynet.manager）
+
+`skynet.register/.name` 等命名功能由 `require "skynet.manager"` 提供：
+
+```lua
+-- 注册本地服务名或全局服务名（含 harbor）
+require "skynet.manager"
+
+-- 注册本地名（以点开头）
+skynet.register(".myservice")
+
+-- 绑定指定 handle 的本地名
+skynet.name(".cache", handle)
+
+-- 注册全局名（不能以冒号或点开头，长度 < 16）
+skynet.register("global_name")
+```
+
+更多管理 API（见 `lualib/skynet/manager.lua`）：
+- `skynet.launch(...)`：启动服务（返回地址数值）。
+- `skynet.kill(name|:addr)`：按名或地址关闭服务。
+- `skynet.abort()`：异常中止当前服务。
+- `skynet.monitor(service, query)`：设置系统监控服务，返回 monitor 地址。
+
+### 4. 协议转发与过滤（forward_type/filter）
+
+可通过 `forward_type` 将某些 `ptype` 映射到既有协议名（如把 `PTYPE_CLIENT` 视为 `"lua"` 处理），或通过 `filter` 包装分发入参：
+
+```lua
+local skynet = require "skynet"
+require "skynet.manager"
+
+-- 将客户端协议转为 lua 协议处理
+skynet.forward_type({ [skynet.PTYPE_CLIENT] = "lua" }, function()
+  -- start_func，仍按标准方式初始化
+  skynet.dispatch("lua", function(session, source, cmd, ...)
+    -- 这里既能处理 PTYPE_LUA，也能处理 PTYPE_CLIENT
+  end)
+end)
+
+-- 过滤器：可改写分发参数或日志埋点
+skynet.filter(function(ptype, msg, sz, session, source)
+  -- 返回给 dispatch_message 的五元组（可改写 prototype 或数据）
+  return ptype, msg, sz, session, source
+end, function()
+  skynet.init_service(function()
+    -- 初始化逻辑
+  end)
+end)
+```
+
+参考实现：`lualib/skynet/manager.lua:53`（register）、`:73`（name）、`:96`（forward_type）、`:110`（filter）。
+
 ## 服务启动流程
 
 ### 1. 启动入口
@@ -761,8 +800,8 @@ debug.init(skynet, {
 - 直接函数引用避免查找
 
 ### 2. Fork 队列优化
-- 环形缓冲区设计
-- 批量执行减少开销
+- 数组队列 + 头尾指针（`fork_queue.h` / `fork_queue.t`）
+- 在 `dispatch_message` 尾部批量执行并在清空后重置指针
 
 ### 3. 追踪控制
 - 三态控制（强制开/关/可选）
@@ -770,7 +809,7 @@ debug.init(skynet, {
 
 ## 架构图
 
-### 协议系统架构
+### 协议系统架构（示例）
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -783,7 +822,7 @@ debug.init(skynet, {
 │  ┌──────────┬──────────┬──────────┐        │
 │  │   lua    │ response │  error   │        │
 │  ├──────────┼──────────┼──────────┤        │
-│  │  system  │  socket  │  debug   │        │
+│  │  socket  │  debug   │  snax    │        │
 │  └──────────┴──────────┴──────────┘        │
 └─────────────┬───────────────────────────────┘
               ↓
@@ -837,6 +876,10 @@ skynet.register_protocol {
 }
 ```
 
+注册后可通过 `skynet.dispatch("myproto", handler)` 绑定处理逻辑，或从 `raw_dispatch_message` 中按 `proto[prototype]` 查找：
+- `proto` 同时以 `name` 与 `id` 作为键（双向索引），因此 `prototype` 可为字符串或数字。
+- 建议：确保自定义协议 `id` 在 0-255 且不与现有常量冲突。
+
 ### 2. 延迟响应模式
 ```lua
 local response_map = {}
@@ -857,6 +900,15 @@ function on_task_complete(task_id, result)
     end
 end
 ```
+
+补充说明：
+- `skynet.response(pack?)` 返回的一次性闭包 `resp(ok, ...)`：
+  - `ok == true` 时按 `pack(...)` 打包并以 `PTYPE_RESPONSE` 返回；
+  - `ok == false` 时返回 `PTYPE_ERROR`；
+  - `ok == "TEST"` 时仅探测闭包是否仍有效（未发送过/未被清理）。
+- 来自 `send` 的请求其 `session == 0`，`response()` 返回空函数（不可响应）。
+- 包过大导致 `c.send(...) == false` 时会自动回落发送 `PTYPE_ERROR`。
+- 参考实现：`lualib/skynet.lua:851`（response）、`:813`（ret）。
 
 ### 3. Fork 并发控制
 ```lua

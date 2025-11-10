@@ -1,3 +1,8 @@
+-- 说明：
+--  sharedata 提供“多版本、只读 + 增量更新”的共享数据：
+--   - 读者获取到的是一个代理对象（box），支持按增量补丁更新（sd.update）
+--   - 背后由 sharedatad 服务统一管理版本与确认
+--   - 适合热更新配置、常量表等场景
 local skynet = require "skynet"
 local sd = require "skynet.sharedata.corelib"
 
@@ -10,6 +15,7 @@ end)
 local sharedata = {}
 local cache = setmetatable({}, { __mode = "kv" })
 
+-- 监听共享对象的新版本并应用增量更新（直到 sharedatad 返回 nil）
 local function monitor(name, obj, cobj)
 	local newobj = cobj
 	while true do
@@ -25,6 +31,7 @@ local function monitor(name, obj, cobj)
 	end
 end
 
+-- 查询共享对象：返回一个可增量更新的代理对象
 function sharedata.query(name)
 	if cache[name] then
 		return cache[name]
@@ -41,18 +48,22 @@ function sharedata.query(name)
 	return r
 end
 
+-- 创建/覆盖一个共享对象
 function sharedata.new(name, v, ...)
 	skynet.call(service, "lua", "new", name, v, ...)
 end
 
+-- 更新共享对象（生成新版本）
 function sharedata.update(name, v, ...)
 	skynet.call(service, "lua", "update", name, v, ...)
 end
 
+-- 删除共享对象
 function sharedata.delete(name)
 	skynet.call(service, "lua", "delete", name)
 end
 
+-- 主动清理本地缓存代理的内部结构并触发 GC
 function sharedata.flush()
 	for name, obj in pairs(cache) do
 		sd.flush(obj)
@@ -60,6 +71,7 @@ function sharedata.flush()
 	collectgarbage()
 end
 
+-- 拷贝共享对象的当前版本数据（深拷贝到普通 Lua 表）
 function sharedata.deepcopy(name, ...)
 	if cache[name] then
 		local cobj = cache[name].__obj

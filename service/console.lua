@@ -1,3 +1,8 @@
+-- 说明：
+--  console 服务从标准输入读取命令：
+--   - `snax <name> [args...]` 启动 snax 服务
+--   - 其他非空行按 `skynet.newservice` 启动
+--  用于简单启动脚本/手动测试。
 local skynet = require "skynet"
 local snax   = require "skynet.snax"
 local socket = require "skynet.socket"

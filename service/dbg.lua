@@ -1,3 +1,7 @@
+-- 说明：
+--  dbg 是一个一次性的小工具服务：
+--   - 将命令参数转发给 .launcher（例如 LIST/MEM/STAT 等）
+--   - 将结果打印到标准输出并退出
 local skynet = require "skynet"
 
 local cmd = { ... }

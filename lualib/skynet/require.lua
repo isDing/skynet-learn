@@ -5,6 +5,12 @@
 -- If you call `require` in main thread ( service main function ), the functions
 -- registered by skynet.init() do not execute immediately, they will be executed
 -- by skynet.start() before start function.
+-- 说明：skynet 模块的“两阶段初始化”机制。
+--  当你 require 一个 skynet 模块时：
+--   1) 先按 Lua 标准行为执行模块主函数
+--   2) 再执行期间通过 skynet.init() 注册的初始化函数（除非在主线程调用 require）
+--  如果在主线程（服务的 main 函数）中调用 require，则第 2 步不会立刻执行，
+--  而是由 skynet.start() 在 start_func 前统一执行（见 M.init_all）。
 
 local M = {}
 
@@ -20,6 +26,7 @@ do
 	local loaded = package.loaded
 	local loading = {}
 
+	-- 带 init 钩子的 require：支持协程间并发 require 与循环依赖保护
 	function M.require(name)
 		local m = loaded[name]
 		if m ~= nil then
@@ -98,6 +105,7 @@ do
 	end
 end
 
+-- 在 skynet.start() 中调用，统一执行主线程阶段注册的 init 列表
 function M.init_all()
 	for _, f in ipairs(context[mainthread]) do
 		f()
@@ -105,6 +113,7 @@ function M.init_all()
 	context[mainthread] = nil
 end
 
+-- 在模块加载过程中注册一个初始化函数（按 require 调用协程归属）
 function M.init(f)
 	assert(type(f) == "function")
 	local co = coroutine.running()

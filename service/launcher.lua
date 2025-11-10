@@ -1,12 +1,17 @@
+-- 说明：
+--  launcher 是系统级服务，负责：
+--   - 启动其他服务（LAUNCH/LOGLAUNCH）并追踪其初始化结果（LAUNCHOK/ERROR）
+--   - 列表/统计/内存/GC/杀死服务等管理命令
+--   - 维护最近启动的实例的 pending 响应（instance/launch_session）
 local skynet = require "skynet"
 local core = require "skynet.core"
 require "skynet.manager"	-- import manager apis
 local string = string
 
-local services = {}
-local command = {}
-local instance = {} -- for confirm (function command.LAUNCH / command.ERROR / command.LAUNCHOK)
-local launch_session = {} -- for command.QUERY, service_address -> session
+local services = {}               -- handle -> "service args" 字符串
+local command = {}                -- 文本/Lua 命令表
+local instance = {}               -- for confirm (function command.LAUNCH / command.ERROR / command.LAUNCHOK) （handle -> response 闭包（等待 init 结果））
+local launch_session = {}         -- for command.QUERY, service_address -> session （handle -> 发起 LAUNCH 的请求 session（用于 QUERY 定位））
 
 local function handle_to_address(handle)
 	return tonumber("0x" .. string.sub(handle , 2))
@@ -15,6 +20,7 @@ end
 local NORET = {}
 
 function command.LIST()
+    -- 枚举所有已知服务及其启动参数
 	local list = {}
 	for k,v in pairs(services) do
 		list[skynet.address(k)] = v
@@ -23,6 +29,7 @@ function command.LIST()
 end
 
 local function list_srv(ti, fmt_func, ...)
+    -- 并发请求所有服务的 debug 命令，收集并格式化结果；ti 为超时
 	local list = {}
 	local sessions = {}
 	local req = skynet.request()
@@ -52,6 +59,7 @@ function command.STAT(addr, ti)
 end
 
 function command.KILL(_, handle)
+    -- 杀死某个服务并从列表移除
 	skynet.kill(handle)
 	local ret = { [skynet.address(handle)] = tostring(services[handle]) }
 	services[handle] = nil
@@ -70,6 +78,7 @@ function command.MEM(addr, ti)
 end
 
 function command.GC(addr, ti)
+    -- 广播 GC，然后再查询内存
 	for k,v in pairs(services) do
 		skynet.send(k,"debug","GC")
 	end
@@ -77,6 +86,7 @@ function command.GC(addr, ti)
 end
 
 function command.REMOVE(_, handle, kill)
+    -- 由服务退出路径回调，清理实例 pending 状态
 	services[handle] = nil
 	local response = instance[handle]
 	if response then
@@ -91,6 +101,7 @@ function command.REMOVE(_, handle, kill)
 end
 
 local function launch_service(service, ...)
+    -- 启动并记录 pending，等待该实例后续回报 LAUNCHOK/ERROR
 	local param = table.concat({...}, " ")
 	local inst = skynet.launch(service, param)
 	local session = skynet.context()
@@ -112,6 +123,7 @@ function command.LAUNCH(_, service, ...)
 end
 
 function command.LOGLAUNCH(_, service, ...)
+    -- 启动并开启该服务日志输出
 	local inst = launch_service(service, ...)
 	if inst then
 		core.command("LOGON", skynet.address(inst))
@@ -122,6 +134,7 @@ end
 function command.ERROR(address)
 	-- see serivce-src/service_lua.c
 	-- init failed
+    -- 初始化失败，唤醒 pending 的 newservice 调用者
 	local response = instance[address]
 	if response then
 		response(false)
@@ -134,6 +147,7 @@ end
 
 function command.LAUNCHOK(address)
 	-- init notice
+    -- 初始化成功，通知等待者并清理 pending 记录
 	local response = instance[address]
 	if response then
 		response(true, address)
