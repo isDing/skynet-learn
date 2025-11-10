@@ -246,6 +246,7 @@ static void sat_SHA1_Final(SHA1_CTX* context, uint8_t digest[SHA1_DIGEST_SIZE])
 #include <lua.h>
 #include <lauxlib.h>
 
+// SHA1 实现
 int
 lsha1(lua_State *L) {
 	size_t sz = 0;
@@ -271,6 +272,7 @@ xor_key(uint8_t key[BLOCKSIZE], uint32_t xor_) {
 	}
 }
 
+// HMAC-SHA1
 LUAMOD_API int
 lhmac_sha1(lua_State *L) {
 	size_t key_sz = 0;

@@ -203,6 +203,7 @@ packrequest(lua_State *L, int is_push) {
 	}
 }
 
+// 打包请求
 static int
 lpackrequest(lua_State *L) {
 	return packrequest(L, 0);
@@ -354,6 +355,7 @@ unpackmreq_string(lua_State *L, const uint8_t * buf, int sz, int is_push) {
 	return 6;
 }
 
+// 解包响应
 static int
 lunpackrequest(lua_State *L) {
 	int sz;

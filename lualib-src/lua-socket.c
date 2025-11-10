@@ -26,17 +26,18 @@
 #define POOL_SIZE_WARNING 32
 #define BUFFER_LIMIT (256 * 1024)
 
+// 缓冲区节点
 struct buffer_node {
-	char * msg;
-	int sz;
-	struct buffer_node *next;
+	char * msg;                 // 消息数据
+	int sz;                    // 数据大小
+	struct buffer_node *next;  // 下一个节点
 };
 
 struct socket_buffer {
-	int size;
-	int offset;
-	struct buffer_node *head;
-	struct buffer_node *tail;
+	int size;                   // 总大小
+	int offset;                // 当前偏移
+	struct buffer_node *head;  // 头节点
+	struct buffer_node *tail;  // 尾节点
 };
 
 static int
@@ -54,16 +55,19 @@ lfreepool(lua_State *L) {
 	return 0;
 }
 
+// 创建内存池
 static int
 lnewpool(lua_State *L, int sz) {
 	struct buffer_node * pool = lua_newuserdatauv(L, sizeof(struct buffer_node) * sz, 0);
 	int i;
+    // 初始化节点链表
 	for (i=0;i<sz;i++) {
 		pool[i].msg = NULL;
 		pool[i].sz = 0;
 		pool[i].next = &pool[i+1];
 	}
 	pool[sz-1].next = NULL;
+    // 设置元表和 GC
 	if (luaL_newmetatable(L, "buffer_pool")) {
 		lua_pushcfunction(L, lfreepool);
 		lua_setfield(L, -2, "__gc");
@@ -84,6 +88,7 @@ lnewbuffer(lua_State *L) {
 }
 
 /*
+// 内存池动态扩展策略
 	userdata send_buffer
 	table pool
 	lightuserdata msg
@@ -113,32 +118,37 @@ lpushbuffer(lua_State *L) {
 	int pool_index = 2;
 	luaL_checktype(L,pool_index,LUA_TTABLE);
 	int sz = luaL_checkinteger(L,4);
-	lua_rawgeti(L,pool_index,1);
+    // 获取空闲节点
+	lua_rawgeti(L,pool_index,1);  // pool[1] 是空闲节点链表头
 	struct buffer_node * free_node = lua_touserdata(L,-1);	// sb poolt msg size free_node
 	lua_pop(L,1);
 	if (free_node == NULL) {
+        // 需要扩展内存池
 		int tsz = lua_rawlen(L,pool_index);
 		if (tsz == 0)
 			tsz++;
+        // 指数增长策略：8, 16, 32, ... 最大 4096
 		int size = 8;
 		if (tsz <= LARGE_PAGE_NODE-3) {
 			size <<= tsz;
 		} else {
-			size <<= LARGE_PAGE_NODE-3;
+			size <<= LARGE_PAGE_NODE-3;  // 4096
 		}
 		lnewpool(L, size);	
 		free_node = lua_touserdata(L,-1);
-		lua_rawseti(L, pool_index, tsz+1);
+		lua_rawseti(L, pool_index, tsz+1);  // 存入 pool 表
 		if (tsz > POOL_SIZE_WARNING) {
 			skynet_error(NULL, "Too many socket pool (%d)", tsz);
 		}
 	}
 	lua_pushlightuserdata(L, free_node->next);	
 	lua_rawseti(L, pool_index, 1);	// sb poolt msg size
+    // 使用节点
 	free_node->msg = msg;
 	free_node->sz = sz;
 	free_node->next = NULL;
 
+    // 加入缓冲区链表
 	if (sb->head == NULL) {
 		assert(sb->tail == NULL);
 		sb->head = sb->tail = free_node;
@@ -172,20 +182,24 @@ return_free_node(lua_State *L, int pool, struct socket_buffer *sb) {
 	lua_rawseti(L, pool, 1);
 }
 
+// 弹出指定大小的数据
 static void
 pop_lstring(lua_State *L, struct socket_buffer *sb, int sz, int skip) {
 	struct buffer_node * current = sb->head;
+    // 优化：数据在单个节点内
 	if (sz < current->sz - sb->offset) {
 		lua_pushlstring(L, current->msg + sb->offset, sz-skip);
 		sb->offset+=sz;
 		return;
 	}
+    // 优化：正好消耗完一个节点
 	if (sz == current->sz - sb->offset) {
 		lua_pushlstring(L, current->msg + sb->offset, sz-skip);
 		return_free_node(L,2,sb);
 		return;
 	}
 
+    // 跨节点读取
 	luaL_Buffer b;
 	luaL_buffinitsize(L, &b, sz);
 	for (;;) {

@@ -412,144 +412,36 @@ inline static void wb_push(struct write_block *b, const void *buf, int sz) {
 
 #### 3.3 整数压缩编码
 
-```c
-// 整数序列化（变长编码）
-static inline void wb_integer(struct write_block *wb, lua_Integer v) {
-    int type = TYPE_NUMBER;
-    
-    if (v == 0) {
-        // 0 只需要 1 字节
-        uint8_t n = COMBINE_TYPE(type, TYPE_NUMBER_ZERO);
-        wb_push(wb, &n, 1);
-    } else if (v >= -128 && v <= 127) {
-        // int8: 2 字节
-        uint8_t n = COMBINE_TYPE(type, TYPE_NUMBER_BYTE);
-        wb_push(wb, &n, 1);
-        uint8_t byte = (uint8_t)v;
-        wb_push(wb, &byte, 1);
-    } else if (v >= -32768 && v <= 32767) {
-        // int16: 3 字节
-        uint8_t n = COMBINE_TYPE(type, TYPE_NUMBER_WORD);
-        wb_push(wb, &n, 1);
-        uint16_t word = (uint16_t)v;
-        wb_push(wb, &word, 2);
-    } else if (v >= -2147483648LL && v <= 2147483647LL) {
-        // int32: 5 字节
-        uint8_t n = COMBINE_TYPE(type, TYPE_NUMBER_DWORD);
-        wb_push(wb, &n, 1);
-        uint32_t dword = (uint32_t)v;
-        wb_push(wb, &dword, 4);
-    } else {
-        // int64: 9 字节
-        uint8_t n = COMBINE_TYPE(type, TYPE_NUMBER_QWORD);
-        wb_push(wb, &n, 1);
-        uint64_t qword = (uint64_t)v;
-        wb_push(wb, &qword, 8);
-    }
-}
-```
+`lua-seri.c` 的 `wb_integer`（`lualib-src/lua-seri.c:143`）会根据数值范围选择不同的编码，但逻辑与常见示例实现存在差异：
+
+- `0` 写为 `TYPE_NUMBER_ZERO`，仍只占 1 字节；
+- **负数不会走 BYTE/WORD 分支**。所有负整数若可放入 32 位就标记为 `TYPE_NUMBER_DWORD`，否则使用 `TYPE_NUMBER_QWORD`；
+- 只有非负整数才会使用 `TYPE_NUMBER_BYTE`（<256）或 `TYPE_NUMBER_WORD`（<65536）的压缩格式；
+- 其他情况统一采用 `TYPE_NUMBER_DWORD`。
+
+因此若在其它模块复用这套编码，需要留意负数始终占用至少 5 字节的事实。
 
 #### 3.4 表序列化
 
-```c
-// 递归序列化表
-static void pack_table(lua_State *L, struct write_block *wb, int index, int depth) {
-    if (depth > MAX_DEPTH) {
-        luaL_error(L, "serialize table depth > %d", MAX_DEPTH);
-    }
-    
-    // 检查循环引用
-    if (luaL_getmetafield(L, index, "__pairs") != LUA_TNIL) {
-        // 支持自定义迭代器
-    }
-    
-    // 数组部分
-    lua_pushnil(L);
-    while (lua_next(L, index) != 0) {
-        if (lua_type(L, -2) == LUA_TNUMBER) {
-            // 序列化数组元素
-            pack_one(L, wb, -1, depth);
-        }
-        lua_pop(L, 1);
-    }
-    
-    // 哈希部分
-    lua_pushnil(L);
-    while (lua_next(L, index) != 0) {
-        if (lua_type(L, -2) != LUA_TNUMBER) {
-            // 序列化键
-            pack_one(L, wb, -2, depth);
-            // 序列化值
-            pack_one(L, wb, -1, depth);
-        }
-        lua_pop(L, 1);
-    }
-    
-    // 表结束标记
-    wb_nil(wb);
-}
-```
+表序列化由 `wb_table`/`wb_table_array`/`wb_table_hash` 协同完成（`lualib-src/lua-seri.c:200` 起）：
+
+- 先根据 `lua_rawlen` 判断数组部分，按 1..N 依序 `pack_one`；
+- 再遍历哈希部分，跳过已写入数组段的整数键，仅写入其它键值对；
+- 若表定义了 `__pairs` 元方法，则改调用 `wb_table_metapairs` 使用自定义迭代器；
+- 所有路径最终都会写入 `wb_nil` 作为结束符，并在深度超过 `MAX_DEPTH` 时抛出错误。
+
+这意味着表的序列化顺序由数组区、哈希区和 `__pairs` 的实现共同决定，业务若依赖顺序需保持一致。
 
 ### 4. 网络包处理 (lua-netpack.c)
 
 #### 4.1 包头处理
 
-```c
-// 解析包头（大端序）
-static int ltostring(lua_State *L) {
-    void * ptr = lua_touserdata(L, 1);
-    int size = luaL_checkinteger(L, 2);
-    
-    if (ptr == NULL) {
-        lua_pushliteral(L, "");
-        return 1;
-    }
-    
-    if (size <= 0) {
-        return luaL_error(L, "Invalid size %d", size);
-    }
-    
-    // 读取 2 字节包头
-    uint8_t * buffer = ptr;
-    int len = buffer[0] << 8 | buffer[1];
-    
-    if (len > size - 2) {
-        return luaL_error(L, "Invalid package size %d", len);
-    }
-    
-    // 返回包体
-    lua_pushlstring(L, (const char *)buffer + 2, len);
-    
-    // 返回剩余数据大小
-    lua_pushinteger(L, size - len - 2);
-    
-    return 2;
-}
+`lua-netpack` 的粘包逻辑在 `lfilter`/`filter_data` 中完成。需要注意：
 
-// 打包数据
-static int lpack(lua_State *L) {
-    size_t len;
-    const char * ptr = luaL_checklstring(L, 1, &len);
-    
-    if (len >= 0x10000) {
-        return luaL_error(L, "Package too large");
-    }
-    
-    uint8_t * buffer = skynet_malloc(len + 2);
-    
-    // 写入包头（大端序）
-    buffer[0] = (len >> 8) & 0xff;
-    buffer[1] = len & 0xff;
-    
-    // 写入包体
-    memcpy(buffer + 2, ptr, len);
-    
-    lua_pushlightuserdata(L, buffer);
-    lua_pushinteger(L, len + 2);
-    
-    return 2;
-}
-```
+- `lpack`（`lualib-src/lua-netpack.c:441`）仍采用“2 字节大端长度 + 数据”的打包格式；
+- **`ltostring` 仅负责把缓冲区转换为 Lua 字符串并释放内存**（`lualib-src/lua-netpack.c:458`），不会解析包头；
+- 真正的拆包和 `struct queue`/`struct uncomplete` 管理在 `filter_data_` 中完成，它负责处理残包、返回 `"data"/"more"/"error"` 等标志，并对半包做缓存；
+- 因此业务模块应始终通过 `skynet.netpack.filter`、`skynet.netpack.pop` 等 API 获取完整报文，而不是绕过这些辅助函数直接操作 `ltostring`。
 
 ### 5. 集群通信支持 (lua-cluster.c)
 
@@ -707,95 +599,25 @@ static int ldhsecret(lua_State *L) {
 
 ### 7. 共享数据模块 (lua-sharedata.c / lua-sharetable.c)
 
-#### 7.1 共享数据设计
+`sharedata` 的实际实现比“仅保存指针和引用计数”复杂得多：
 
-```c
-// 共享数据结构
-struct sharedata {
-    int ref;           // 引用计数
-    void * data;       // 数据指针
-    size_t sz;         // 数据大小
-};
+- 核心结构包括 `struct state`、`struct table`、`struct node` 等（`lualib-src/lua-sharedata.c:21` 起），`struct table` 同时维护数组区、哈希区和字符串池；
+- `convtable`/`setvalue` 会把 Lua 表深拷贝为只读快照，支持嵌套表，并将字符串去重存储；
+- 引用计通过 `ATOM_INT ref` 维护，更新时走写时复制路径，避免读服务被阻塞；
+- `lua-sharetable.c` 在启用 `makeshared` 时会直接操作 Lua VM 内部结构（如 `Table`、`LClosure`），提供共享表、共享函数的 GC 控制；
+- 模块还实现了 `sharedata.box`、`sharedata.clone` 等辅助函数，配合 `DATACENTER` 等服务实现热更新。
 
-// 创建共享数据
-static int lnew(lua_State *L) {
-    size_t sz;
-    void * data = get_data(L, 1, &sz);
-    
-    struct sharedata * sd = lua_newuserdata(L, sizeof(*sd));
-    sd->ref = 1;
-    sd->data = skynet_malloc(sz);
-    sd->sz = sz;
-    
-    memcpy(sd->data, data, sz);
-    
-    // 设置元表
-    luaL_getmetatable(L, "sharedata");
-    lua_setmetatable(L, -2);
-    
-    return 1;
-}
-
-// 增加引用
-static int laddref(lua_State *L) {
-    struct sharedata * sd = luaL_checkudata(L, 1, "sharedata");
-    __sync_add_and_fetch(&sd->ref, 1);
-    return 0;
-}
-
-// 减少引用
-static int lrelease(lua_State *L) {
-    struct sharedata * sd = luaL_checkudata(L, 1, "sharedata");
-    if (__sync_sub_and_fetch(&sd->ref, 1) == 0) {
-        skynet_free(sd->data);
-        sd->data = NULL;
-    }
-    return 0;
-}
-```
+因此文档不再给出“简化结构体示例”，避免与实际行为不一致，建议直接查阅源码理解完整状态机。
 
 ### 8. 调试通道 (lua-debugchannel.c)
 
-#### 8.1 调试通道实现
+`lua-debugchannel.c` 实现的是 **进程内** 的指令通道：
 
-```c
-// 调试通道结构
-struct debug_channel {
-    struct skynet_context * ctx;
-    int fd;  // socket fd
-};
-
-// 创建调试通道
-static int lcreate(lua_State *L) {
-    struct skynet_context * ctx = lua_touserdata(L, lua_upvalueindex(1));
-    const char * addr = luaL_checkstring(L, 1);
-    int port = luaL_checkinteger(L, 2);
-    
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        lua_pushnil(L);
-        return 1;
-    }
-    
-    // 连接调试服务器
-    struct sockaddr_in server;
-    server.sin_family = AF_INET;
-    server.sin_port = htons(port);
-    inet_pton(AF_INET, addr, &server.sin_addr);
-    
-    if (connect(fd, (struct sockaddr *)&server, sizeof(server)) < 0) {
-        close(fd);
-        lua_pushnil(L);
-        return 1;
-    }
-    
-    struct debug_channel * dc = lua_newuserdata(L, sizeof(*dc));
-    dc->ctx = ctx;
-    dc->fd = fd;
-    
-    return 1;
-}
-```
+- `struct channel` 维护一条带自旋锁的链表队列，`channel_write`/`channel_read` 负责写入与读取命令（`lualib-src/lua-debugchannel.c:13` 起）；
+- `lcreate` 会创建 `channel_box` userdata 保存队列指针，`lconnect` 可获取同一队列的引用；
+- `read` 支持超时时间，使用 `usleep` 轮询等待新命令；
+- `__gc` 元方法在引用计数归零时释放链表，不涉及任何 socket；
+- 若需要远程调试，可以在 Lua 层结合 `skynet.socket` 自行搭建网络隧道，而不是改动该模块。
 
 ## 内存管理策略
 

@@ -46,25 +46,30 @@ traceback (lua_State *L) {
 	return 1;
 }
 
+// 回调上下文
 struct callback_context {
-	lua_State *L;
+	lua_State *L;  // Lua 协程状态
 };
 
+// 消息回调处理
 static int
 _cb(struct skynet_context * context, void * ud, int type, int session, uint32_t source, const void * msg, size_t sz) {
 	struct callback_context *cb_ctx = (struct callback_context *)ud;
 	lua_State *L = cb_ctx->L;
 	int trace = 1;
 	int r;
+    // 压入回调函数
 	lua_pushvalue(L,2);
 
-	lua_pushinteger(L, type);
-	lua_pushlightuserdata(L, (void *)msg);
-	lua_pushinteger(L,sz);
-	lua_pushinteger(L, session);
-	lua_pushinteger(L, source);
+    // 压入参数
+	lua_pushinteger(L, type);        // 消息类型
+	lua_pushlightuserdata(L, (void *)msg);  // 消息内容
+	lua_pushinteger(L,sz);           // 消息大小
+	lua_pushinteger(L, session);     // 会话 ID
+	lua_pushinteger(L, source);      // 源服务
 
-	r = lua_pcall(L, 5, 0 , trace);
+    // 调用 Lua 函数
+	r = lua_pcall(L, 5, 0 , trace);  // 1 是 traceback 函数索引
 
 	if (r == LUA_OK) {
 		return 0;
@@ -119,25 +124,31 @@ _forward_pre(struct skynet_context *context, void *ud, int type, int session, ui
 	return forward_cb(context, cb_ctx, type, session, source, msg, sz);
 }
 
+// 设置回调
 static int
 lcallback(lua_State *L) {
 	struct skynet_context * context = lua_touserdata(L, lua_upvalueindex(1));
 	int forward = lua_toboolean(L, 2);
 	luaL_checktype(L,1,LUA_TFUNCTION);
 	lua_settop(L,1);
+    // 创建回调上下文
 	struct callback_context * cb_ctx = (struct callback_context *)lua_newuserdatauv(L, sizeof(*cb_ctx), 2);
-	cb_ctx->L = lua_newthread(L);
+	cb_ctx->L = lua_newthread(L);  // 创建新协程
+    // 设置 traceback
 	lua_pushcfunction(cb_ctx->L, traceback);
 	lua_setiuservalue(L, -2, 1);
 	lua_getfield(L, LUA_REGISTRYINDEX, "callback_context");
 	lua_setiuservalue(L, -2, 2);
 	lua_setfield(L, LUA_REGISTRYINDEX, "callback_context");
+    // 移动回调函数到新协程
 	lua_xmove(L, cb_ctx->L, 1);
 
+    // 注册回调
 	skynet_callback(context, cb_ctx, (forward)?(_forward_pre):(_cb_pre));
 	return 0;
 }
 
+// 执行命令
 static int
 lcommand(lua_State *L) {
 	struct skynet_context * context = lua_touserdata(L, lua_upvalueindex(1));
@@ -156,6 +167,7 @@ lcommand(lua_State *L) {
 	return 0;
 }
 
+// 地址解析命令
 static int
 laddresscommand(lua_State *L) {
 	struct skynet_context * context = lua_touserdata(L, lua_upvalueindex(1));
@@ -166,6 +178,7 @@ laddresscommand(lua_State *L) {
 		parm = luaL_checkstring(L,2);
 	}
 	result = skynet_command(context, cmd, parm);
+    // 解析 ":01000010" 格式的地址
 	if (result && result[0] == ':') {
 		int i;
 		uint32_t addr = 0;
@@ -242,11 +255,13 @@ get_dest_string(lua_State *L, int index) {
 	return dest_string;
 }
 
+// 发送消息的核心函数
 static int
 send_message(lua_State *L, int source, int idx_type) {
 	struct skynet_context * context = lua_touserdata(L, lua_upvalueindex(1));
 	uint32_t dest = (uint32_t)lua_tointeger(L, 1);  // 尝试解析为数字
 	const char * dest_string = NULL;
+    // 支持数字地址和字符串地址
 	if (dest == 0) {
 		if (lua_type(L,1) == LUA_TNUMBER) {
 			return luaL_error(L, "Invalid service address 0");
@@ -257,15 +272,18 @@ send_message(lua_State *L, int source, int idx_type) {
 
 	int type = luaL_checkinteger(L, idx_type+0);
 	int session = 0;
+    // 自动分配 session
 	if (lua_isnil(L,idx_type+1)) {
 		type |= PTYPE_TAG_ALLOCSESSION;
 	} else {
 		session = luaL_checkinteger(L,idx_type+1);
 	}
 
+    // 处理不同类型的消息
 	int mtype = lua_type(L,idx_type+2);
 	switch (mtype) {
 	case LUA_TSTRING: {
+        // 字符串消息
 		size_t len = 0;
 		void * msg = (void *)lua_tolstring(L,idx_type+2,&len);
 		if (len == 0) {
@@ -279,6 +297,7 @@ send_message(lua_State *L, int source, int idx_type) {
 		break;
 	}
 	case LUA_TLIGHTUSERDATA: {
+        // 轻量用户数据（零拷贝）
 		void * msg = lua_touserdata(L,idx_type+2);
 		int size = luaL_checkinteger(L,idx_type+3);
 		if (dest_string) {

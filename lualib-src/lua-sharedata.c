@@ -21,6 +21,8 @@
 struct table;
 
 union value {
+	// 中文注释：为减少 GC 压力，这里手动保存 Lua 基础类型的值，
+	// 表更新时会分配新的 table/array/node，读端始终指向不可变快照。
 	lua_Number n;
 	lua_Integer d;
 	struct table * tbl;
@@ -123,6 +125,9 @@ static int convtable(lua_State *L);
 
 static void
 setvalue(struct context * ctx, lua_State *L, int index, struct node *n) {
+	// 中文注释：这个函数负责把任意 Lua 值变成 sharedata 的不可变表示，
+	// 包括递归转换子表、记录字符串索引以及布尔/整数/浮点分类，
+	// 之后读取方无需再访问 Lua VM，而是直接读快照。
 	int vt = lua_type(L, index);
 	switch(vt) {
 	case LUA_TNIL:
@@ -276,6 +281,8 @@ fillcolliding(lua_State *L, struct context *ctx) {
 // struct context * ctx
 static int
 convtable(lua_State *L) {
+	// 中文注释：将 Lua 表转换为 sharedata 的不可变结构，
+	// 在转换过程中会遍历数组区和哈希区，并为哈希部分建立主槽/冲突链。
 	int i;
 	struct context *ctx = lua_touserdata(L,2);
 	struct table *tbl = ctx->tbl;

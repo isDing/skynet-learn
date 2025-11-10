@@ -150,6 +150,8 @@ expand_queue(lua_State *L, struct queue *q) {
 
 static void
 push_data(lua_State *L, int fd, void *buffer, int size, int clone) {
+	// 中文注释：当同一个 fd 在一次 epoll 事件中带来多个包时，
+	// 这里会把剩余数据全部入队，等待上层通过 netpack.pop 逐条取出。
 	if (clone) {
 		void * tmp = skynet_malloc(size);
 		memcpy(tmp, buffer, size);
@@ -227,6 +229,8 @@ close_uncomplete(lua_State *L, int fd) {
 
 static int
 filter_data_(lua_State *L, int fd, uint8_t * buffer, int size) {
+	// 中文注释：filter 的职责是把 socket 层的原始字节流切分为“完整包 + 状态枚举”，
+	// 未完整的数据会暂存在 queue/uncomplete 中，等后续字节到来再拼接。
 	struct queue *q = lua_touserdata(L,1);
 	struct uncomplete * uc = find_uncomplete(q, fd);
 	if (uc) {
@@ -270,6 +274,7 @@ filter_data_(lua_State *L, int fd, uint8_t * buffer, int size) {
 		return 2;
 	} else {
 		if (size == 1) {
+			// 中文注释：仅收到一个字节且不是完整包头时，先挂起等待后续字节，避免误判。
 			struct uncomplete * uc = save_uncomplete(L, fd);
 			uc->read = -1;
 			uc->header = *buffer;

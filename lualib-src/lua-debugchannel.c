@@ -16,6 +16,8 @@ struct command {
 };
 
 struct channel {
+	// 中文注释：debugchannel 是进程内的“命令管道”，使用自旋锁保护单链表，
+	// 便于不同 Lua 状态机之间传递调试字符串而无需依赖 socket。
 	struct spinlock lock;
 	int ref;
 	struct command * head;
@@ -70,6 +72,8 @@ channel_release(struct channel *c) {
 // call free after channel_read
 static struct command *
 channel_read(struct channel *c, double timeout) {
+	// 中文注释：读取时若队列为空，会按超时时间主动 usleep；
+	// 这样避免长期占用 CPU，同时保持实现简单，不需要条件变量。
 	struct command * ret = NULL;
 	SPIN_LOCK(c)
 	if (c->head == NULL) {

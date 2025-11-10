@@ -37,15 +37,18 @@
 #define BLOCK_SIZE 128
 #define MAX_DEPTH 32
 
+// 块结构
 struct block {
 	struct block * next;
-	char buffer[BLOCK_SIZE];
+	char buffer[BLOCK_SIZE];  // 128 字节
 };
 
+// 写入块结构
 struct write_block {
-	struct block * head;
-	struct block * current;
-	int len;
+	struct block * head;     // 块链表头
+	struct block * current;  // 当前块
+	int len;                 // 总长度
+	int ptr;                 // 当前位置
 	int ptr;
 };
 
@@ -62,24 +65,29 @@ blk_alloc(void) {
 	return b;
 }
 
+// 高效写入
 inline static void
 wb_push(struct write_block *b, const void *buf, int sz) {
 	const char * buffer = buf;
 	if (b->ptr == BLOCK_SIZE) {
+        // 分配新块
 _again:
 		b->current = b->current->next = blk_alloc();
 		b->ptr = 0;
 	}
 	if (b->ptr <= BLOCK_SIZE - sz) {
+        // 单块写入
 		memcpy(b->current->buffer + b->ptr, buffer, sz);
 		b->ptr+=sz;
 		b->len+=sz;
 	} else {
+        // 跨块写入
 		int copy = BLOCK_SIZE - b->ptr;
 		memcpy(b->current->buffer + b->ptr, buffer, copy);
 		buffer += copy;
 		b->len += copy;
 		sz -= copy;
+        // 继续到下一块
 		goto _again;
 	}
 }
@@ -141,6 +149,9 @@ wb_boolean(struct write_block *wb, int boolean) {
 
 static inline void
 wb_integer(struct write_block *wb, lua_Integer v) {
+	// 中文注释：Skynet 为保证跨语言解包一致，选择“负数统一保留补码宽度”的策略，
+	// 因此只有非负整数才会走 BYTE/WORD 压缩分支，负数直接写成 32 或 64 位，
+	// 这样序列化、反序列化两端都不需要关注符号扩展细节。
 	int type = TYPE_NUMBER;
 	if (v == 0) {
 		uint8_t n = COMBINE_TYPE(type , TYPE_NUMBER_ZERO);
@@ -216,6 +227,8 @@ static void pack_one(lua_State *L, struct write_block *b, int index, int depth);
 
 static int
 wb_table_array(lua_State *L, struct write_block * wb, int index, int depth) {
+	// 中文注释：数组区只处理 1..rawlen 的整数键，保持 Lua “序列”定义，
+	// 避免将稀疏数组重复写入哈希区。
 	int array_size = lua_rawlen(L,index);
 	if (array_size >= MAX_COOKIE-1) {
 		uint8_t n = COMBINE_TYPE(TYPE_TABLE, MAX_COOKIE-1);
@@ -238,6 +251,8 @@ wb_table_array(lua_State *L, struct write_block * wb, int index, int depth) {
 
 static void
 wb_table_hash(lua_State *L, struct write_block * wb, int index, int depth, int array_size) {
+	// 中文注释：哈希区遍历所有键值对，但会跳过已经写入数组区的 1..array_size，
+	// 最后追加一个 NIL 作为结束标记，对应反序列化时的 while loop 终止条件。
 	lua_pushnil(L);
 	while (lua_next(L, index) != 0) {
 		if (lua_type(L,-2) == LUA_TNUMBER) {
