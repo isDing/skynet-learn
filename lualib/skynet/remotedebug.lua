@@ -1,3 +1,9 @@
+-- 说明：
+--  remotedebug 提供远程交互式调试能力：进入“调试模式”后，可以通过 socket 远端发送命令，
+--  在服务内执行表达式/语句、设置钩子、单步/下一步/继续等。核心机制：
+--    - 替换 skynet.dispatch_message 的内部 raw_dispatch_message 为带钩子的版本
+--    - 通过 debugchannel 与远端交互（读取命令、回显输出），print 重定向到 socket
+--    - 设置 linehook/skip_hook 实现断点样式的单步，watch_proto 实现按协议触发进入调试
 local skynet = require "skynet"
 local debugchannel = require "skynet.debugchannel"
 local socketdriver = require "skynet.socketdriver"
@@ -10,7 +16,7 @@ local sethook = debugchannel.sethook
 
 local M = {}
 
-local HOOK_FUNC = "raw_dispatch_message"
+local HOOK_FUNC = "raw_dispatch_message"  -- 目标 upvalue 名称（在 dispatcher 内部闭包中）
 local raw_dispatcher
 local print = _G.print
 local skynet_suspend
@@ -19,11 +25,13 @@ local prompt
 local newline
 
 local function change_prompt(s)
+	-- 更新远端提示符
 	newline = true
 	prompt = s
 end
 
 local function replace_upvalue(func, uvname, value)
+	-- 在闭包中找到名为 uvname 的 upvalue，并可选择替换其值
 	local i = 1
 	while true do
 		local name, uv = debug.getupvalue(func, i)
@@ -41,6 +49,7 @@ local function replace_upvalue(func, uvname, value)
 end
 
 local function remove_hook(dispatcher)
+	-- 退出调试模式：还原 raw_dispatch_message、恢复 print、记录日志
 	assert(raw_dispatcher, "Not in debug mode")
 	replace_upvalue(dispatcher, HOOK_FUNC, raw_dispatcher)
 	raw_dispatcher = nil
@@ -69,6 +78,7 @@ local function run_exp(ok, ...)
 end
 
 local function run_cmd(cmd, env, co, level)
+	-- 先尝试当作表达式返回（"return ..."），失败再当作语句执行
 	if not run_exp(injectrun("return "..cmd, co, level, env)) then
 		print(select(2, injectrun(cmd,co, level,env)))
 	end
@@ -80,6 +90,7 @@ local ctx_active = {}
 
 local linehook
 local function skip_hook(mode)
+	-- 用于“下一步”逻辑：跨越来自 skynet.start 的跳转或其他非用户代码
 	local co = coroutine.running()
 	local ctx = ctx_active[co]
 	if mode == "return" then
@@ -94,6 +105,7 @@ local function skip_hook(mode)
 end
 
 function linehook(mode, line)
+	-- 行级钩子：更新提示符、在用户代码处 yield，触发远端命令读取
 	local co = coroutine.running()
 	local ctx = ctx_active[co]
 	if mode ~= "line" then
@@ -121,6 +133,7 @@ function linehook(mode, line)
 end
 
 local function add_watch_hook()
+	-- 进入“监听模式”：在下次命中条件时切换到行级钩子
 	local co = coroutine.running()
 	local ctx = {}
 	ctx_active[co] = ctx
@@ -139,6 +152,7 @@ local function add_watch_hook()
 end
 
 local function watch_proto(protoname, cond)
+	-- 监听指定协议的下一次分发（可选 cond 过滤），命中后挂上行级钩子
 	local proto = assert(replace_upvalue(skynet.register_protocol, "proto"), "Can't find proto table")
 	local p = proto[protoname]
 	if p == nil then
@@ -159,6 +173,7 @@ local function watch_proto(protoname, cond)
 end
 
 local function remove_watch()
+	-- 取消所有监听：移除钩子并清空 ctx_active
 	for co in pairs(ctx_active) do
 		sethook(co)
 	end
@@ -187,6 +202,7 @@ function dbgcmd.c(co)
 end
 
 local function hook_dispatch(dispatcher, resp, fd, channel)
+	-- 用 hook 包裹 dispatcher：拦截执行前进入 debug_loop，随后调用原始 dispatcher
 	change_prompt(string.format(":%08x>", skynet.self()))
 
 	print = gen_print(fd)
@@ -210,6 +226,7 @@ local function hook_dispatch(dispatcher, resp, fd, channel)
 	end
 
 	local function debug_hook()
+		-- 交互主循环：打印提示符、读取远端命令、执行、直到 cont 为止
 		while true do
 			if newline then
 				socketdriver.send(fd, prompt)
@@ -258,6 +275,7 @@ local function hook_dispatch(dispatcher, resp, fd, channel)
 end
 
 function M.start(import, fd, handle)
+	-- 开启远程调试：替换 dispatcher 内部 raw_dispatch_message，并与远端建立控制通道
 	local dispatcher = import.dispatch
 	skynet_suspend = import.suspend
 	skynet_resume = import.resume

@@ -1,3 +1,10 @@
+-- 说明：
+--  socketchannel 封装了基于 TCP 的请求/响应通道，支持：
+--   - 自动重连与主备地址切换
+--   - 会话模式（desc.response 解析 session）与顺序模式（FIFO 匹配响应）
+--   - 认证流程（desc.auth）
+--   - 过载（发送缓冲积压）通知
+--  常用于数据库/外部服务连接（mysql/redis/mongo 等）。
 local skynet = require "skynet"
 local socket = require "skynet.socket"
 local socketdriver = require "skynet.socketdriver"
@@ -5,7 +12,7 @@ local socketdriver = require "skynet.socketdriver"
 -- channel support auto reconnect , and capture socket error in request/response transaction
 -- { host = "", port = , auth = function(so) , response = function(so) session, data }
 
-local socket_channel = {}
+local socket_channel = {}  -- 导出模块
 local channel = {}
 local channel_socket = {}
 local channel_meta = { __index = channel }
@@ -24,6 +31,11 @@ local socket_error = setmetatable({}, {__tostring = function() return "[Error: s
 socket_channel.error = socket_error
 
 function socket_channel.channel(desc)
+	-- 创建一个 channel：
+	--  desc = {
+	--    host, port, backup={...}, auth(sock)->ok, response(sock)->session,data,padding,
+	--    nodelay=true/false, overload=function(flag), socket_read/line 可替换底层读取
+	--  }
 	local c = {
 		__host = assert(desc.host),
 		__port = assert(desc.port),
@@ -57,6 +69,7 @@ function socket_channel.channel(desc)
 end
 
 local function close_channel_socket(self)
+	-- 主动关闭底层连接并唤醒等待响应的协程
 	if self.__sock then
 		local so = self.__sock
 		self.__sock = false
@@ -70,6 +83,7 @@ local function close_channel_socket(self)
 end
 
 local function wakeup_all(self, errmsg)
+	-- 将所有等待者（会话或顺序队列）唤醒，并返回 socket_error
 	if self.__response then
 		for k,co in pairs(self.__thread) do
 			self.__thread[k] = nil
@@ -94,6 +108,7 @@ local function wakeup_all(self, errmsg)
 end
 
 local function dispatch_by_session(self)
+	-- 会话模式：desc.response 负责从流中解析一条响应及其 session
 	local response = self.__response
 	-- response() return session
 	while self.__sock do
@@ -137,6 +152,7 @@ local function dispatch_by_session(self)
 end
 
 local function pop_response(self)
+	-- 顺序模式：按 FIFO 取出一个等待响应项
 	while self.__sock do
 		local func,co = table.remove(self.__request, 1), table.remove(self.__thread, 1)
 		if func then
@@ -149,6 +165,7 @@ end
 
 -- on close callback
 local function autoclose_cb(self, fd)
+	-- onclose 回调：若对端关闭当前 fd，则关闭通道
 	local sock = self.__sock
 	if self.__wait_response and sock and sock[1] == fd then
 		-- closed by peer
@@ -158,6 +175,7 @@ local function autoclose_cb(self, fd)
 end
 
 local function push_response(self, response, co)
+	-- 登记等待者：会话模式登记到 session -> co；顺序模式压入队列
 	if self.__response then
 		-- response is session
 		self.__thread[response] = co
@@ -173,6 +191,7 @@ local function push_response(self, response, co)
 end
 
 local function get_response(func, sock)
+	-- 顺序模式：执行解析函数，支持分片（padding）累计
 	local result_ok, result_data, padding = func(sock)
 	if result_ok and padding then
 		local result = { result_data }
@@ -192,6 +211,7 @@ local function get_response(func, sock)
 end
 
 local function dispatch_by_order(self)
+	-- 顺序模式：循环解析响应并唤醒等待者；异常时关闭通道并广播错误
 	while self.__sock do
 		local func, co = pop_response(self)
 		if not co then
@@ -236,6 +256,7 @@ local function dispatch_by_order(self)
 end
 
 local function dispatch_function(self)
+	-- 根据模式选择分发函数；顺序模式下注册 onclose 保持一致性
 	if self.__response then
 		return dispatch_by_session
 	else
@@ -247,6 +268,7 @@ local function dispatch_function(self)
 end
 
 local function term_dispatch_thread(self)
+	-- 在重新连接前先结束旧的分发协程（顺序模式）
 	if not self.__response and self.__dispatch_thread then
 		-- dispatch by order, send close signal to dispatch thread
 		push_response(self, true, false)	-- (true, false) is close signal
@@ -254,6 +276,7 @@ local function term_dispatch_thread(self)
 end
 
 local function connect_once(self)
+	-- 单次连接流程：应用 nodelay/overload 回调，重启分发协程
 	if self.__closed then
 		return false
 	end
@@ -414,6 +437,7 @@ local function try_connect(self , once)
 end
 
 local function check_connection(self)
+	-- 检查是否已连接/正在认证/已断开/已关闭，返回 true/false/nil（nil 表示需发起连接）
 	if self.__sock then
 		local authco = self.__authcoroutine
 		if socket.disconnected(self.__sock[1]) then
@@ -440,6 +464,7 @@ local function check_connection(self)
 end
 
 local function block_connect(self, once)
+	-- 多协程竞争连接：首个协程负责连接，其余协程排队等待；连接完成后统一唤醒
 	local r = check_connection(self)
 	if r ~= nil then
 		return r
@@ -472,11 +497,13 @@ local function block_connect(self, once)
 end
 
 function channel:connect(once)
+	-- 对外导出的连接接口：once=true 仅尝试一次，不重试
 	self.__closed = false
 	return block_connect(self, once)
 end
 
 local function wait_for_response(self, response)
+	-- 将当前协程压入等待队列，等待响应解析流程唤醒
 	local co = coroutine.running()
 	push_response(self, response, co)
 	skynet.wait(co)
@@ -502,6 +529,7 @@ local socket_write = socket.write
 local socket_lwrite = socket.lwrite
 
 local function sock_err(self)
+	-- 写入失败：关闭连接并唤醒所有等待者，抛 socket_error
 	close_channel_socket(self)
 	wakeup_all(self)
 	error(socket_error)

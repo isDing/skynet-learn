@@ -1,3 +1,10 @@
+-- 说明：
+--  msgserver 基于 gateserver 封装了一个“带登录鉴权 + 请求/响应”的客户端消息网关。
+--  特点：
+--    - 首包握手认证（base64(uid)@base64(server)#base64(subid):index:base64(hmac)）
+--    - 之后的包采用带会话的请求/响应格式（大小端：大端序）
+--    - 支持重发/重连后的响应重投递（response cache + 版本/索引控制）
+--  依赖：netpack 做包编解码，crypt 做 hmac 校验，socketdriver 发包。
 local skynet = require "skynet"
 local gateserver = require "snax.gateserver"
 local netpack = require "skynet.netpack"
@@ -85,6 +92,13 @@ skynet.register_protocol {
 local user_online = {}
 local handshake = {}
 local connection = {}
+-- user_online[username] = {
+--   secret, version, index, username,
+--   response = { [session] = { return_fd, response_bin, version_at_build, index_at_build } },
+--   fd, ip
+-- }
+-- handshake[fd] = addr  -- 记录新连接在通过认证前的地址，首个包走认证流程
+-- connection[fd] = user_online[username]  -- 通过认证后的 fd -> 用户映射
 
 function server.userid(username)
 	-- base64(uid)@base64(server)#base64(subid)
@@ -137,21 +151,25 @@ function server.start(conf)
 	}
 
 	function handler.command(cmd, source, ...)
+		-- 处理外部 skynet 命令（来自 loginserver/agent），如 login/logout/kick
 		local f = assert(CMD[cmd])
 		return f(...)
 	end
 
 	function handler.open(source, gateconf)
+		-- 网关监听建立后回调：通知上层注册当前 server 名
 		local servername = assert(gateconf.servername)
 		return conf.register_handler(servername)
 	end
 
 	function handler.connect(fd, addr)
+		-- 新连接建立：记录地址，打开客户端收消息；首包走认证
 		handshake[fd] = addr
 		gateserver.openclient(fd)
 	end
 
 	function handler.disconnect(fd)
+		-- 连接断开：清理状态并通知上层 disconnect_handler（若提供）
 		handshake[fd] = nil
 		local c = connection[fd]
 		if c then
@@ -171,6 +189,7 @@ function server.start(conf)
 
 	-- atomic , no yield
 	local function do_auth(fd, message, addr)
+		-- 认证流程（不可 yield）：校验 index 递增与 HMAC，成功后绑定 fd/ip
 		local username, index, hmac = string.match(message, "([^:]*):([^:]*):([^:]*)")
 		local u = user_online[username]
 		if u == nil then
@@ -196,6 +215,7 @@ function server.start(conf)
 	end
 
 	local function auth(fd, addr, msg, sz)
+		-- 认证入口：解析首包、调用 do_auth，返回 200 OK/错误码，并按需关闭连接
 		local message = netpack.tostring(msg, sz)
 		local ok, result = pcall(do_auth, fd, message, addr)
 		if not ok then
@@ -217,9 +237,11 @@ function server.start(conf)
 	end
 
 	local request_handler = assert(conf.request_handler)
+	-- 上层业务请求处理函数：形如 function(username, message) return response_string end
 
 	-- u.response is a struct { return_fd , response, version, index }
 	local function retire_response(u)
+		-- 清理过期响应：通过 index 窗口移动删除过旧的已完成响应，控制缓存量
 		if u.index >= expired_number * 2 then
 			local max = 0
 			local response = u.response
@@ -241,6 +263,7 @@ function server.start(conf)
 	end
 
 	local function do_request(fd, message)
+		-- 处理业务请求：按会话处理重发/复用，执行上层 handler 并缓存响应用于重投递
 		local u = assert(connection[fd], "invalid fd")
 		local session = string.unpack(">I4", message, -4)
 		message = message:sub(1,-5)
@@ -297,6 +320,7 @@ function server.start(conf)
 	end
 
 	local function request(fd, msg, sz)
+		-- 网关入口：解包、调用 do_request（可能 yield），异常时关闭连接
 		local message = netpack.tostring(msg, sz)
 		local ok, err = pcall(do_request, fd, message)
 		-- not atomic, may yield
@@ -309,6 +333,7 @@ function server.start(conf)
 	end
 
 	function handler.message(fd, msg, sz)
+		-- 新连接的首包走 auth，之后的包走业务 request
 		local addr = handshake[fd]
 		if addr then
 			auth(fd,addr,msg,sz)

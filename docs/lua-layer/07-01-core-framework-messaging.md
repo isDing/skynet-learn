@@ -20,12 +20,12 @@ local session_coroutine_id = {}        -- coroutine -> session
 local session_coroutine_address = {}   -- coroutine -> source address
 local session_coroutine_tracetag = {}  -- coroutine -> trace tag
 
--- 未响应的请求
+-- 未响应的请求（response 函数 -> 对端地址）
 local unresponse = {}
 
--- 等待队列
+-- 唤醒队列与睡眠映射
 local wakeup_queue = {}
-local sleep_session = {}
+local sleep_session = {}               -- token -> session
 
 -- 监控会话
 local watching_session = {}            -- session -> watching service
@@ -48,7 +48,7 @@ local skynet = {
     PTYPE_HARBOR = 5,      -- Harbor 消息
     PTYPE_SOCKET = 6,      -- Socket 消息
     PTYPE_ERROR = 7,       -- 错误消息
-    PTYPE_QUEUE = 8,       -- 队列消息（已废弃）
+    PTYPE_QUEUE = 8,       -- 队列消息（对应早期 mqueue，已废弃；使用 skynet.queue 替代）
     PTYPE_DEBUG = 9,       -- 调试消息
     PTYPE_LUA = 10,        -- Lua 消息
     PTYPE_SNAX = 11,       -- SNAX 消息
@@ -904,32 +904,32 @@ end
 ### 消息流转
 
 ```
-skynet.send/call
-     ↓
-打包消息 (proto.pack)
-     ↓
-分配会话 ID (auxsend)
-     ↓
-┌─────────────────────┐
-│  session_id_coroutine │
-│  watching_session     │
-└─────────────────────┘
-     ↓
-C层发送 (c.send)
-     ↓
-  目标服务
-     ↓
-消息处理
-     ↓
-skynet.ret
-     ↓
-响应消息
-     ↓
-原服务收到响应
-     ↓
-coroutine_resume
-     ↓
-解包返回 (proto.unpack)
+skynet.send                   skynet.call
+     ↓                             ↓
+打包消息 (proto.pack)         打包消息 (proto.pack)
+     ↓                             ↓
+session=0 直接发送             分配会话ID (auxsend)
+     ↓                             ↓
+   c.send                     记录映射：
+                               - session_id_coroutine
+                               - watching_session
+                                  ↓
+                               c.send
+                 ──────────────────┼──────────────────
+                                   ↓
+                                 目标服务
+                                   ↓
+                                消息处理
+                                   ↓
+                                skynet.ret/response
+                                   ↓
+                                响应消息
+                                   ↓
+                            原服务收到响应
+                                   ↓
+                             coroutine_resume
+                                   ↓
+                          解包返回 (proto.unpack)
 ```
 
 ## 小结

@@ -1,10 +1,13 @@
+-- 说明：
+--  提供面向流（TCP）与数据报（UDP）的高层 socket API，封装底层 socketdriver，
+--  并与 skynet 的协程机制结合，提供阻塞式 read/accept 等接口（实际通过挂起协程实现）。
 local driver = require "skynet.socketdriver"
 local skynet = require "skynet"
 local skynet_core = require "skynet.core"
 local assert = assert
 
 local BUFFER_LIMIT = 128 * 1024
-local socket = {}	-- api
+local socket = {}	-- api 导出的 API 表
 local socket_pool = setmetatable( -- store all socket object
 	{},
 	{ __gc = function(p)
@@ -16,8 +19,8 @@ local socket_pool = setmetatable( -- store all socket object
 	}
 )
 
-local socket_onclose = {}
-local socket_message = {}
+local socket_onclose = {}   -- fd -> onclose 回调（close 后回调）
+local socket_message = {}   -- socket 协议的分发表（由 C 层回调触发）
 
 local function wakeup(s)
 	local co = s.co
@@ -28,6 +31,7 @@ local function wakeup(s)
 end
 
 local function pause_socket(s, size)
+	-- 当缓冲区过大或上层处理过慢时，临时暂停底层 fd 的读
 	if s.pause ~= nil then
 		return
 	end
@@ -42,6 +46,7 @@ local function pause_socket(s, size)
 end
 
 local function suspend(s)
+	-- 将当前协程挂起到 s.co，并根据 s.pause 状态决定是否恢复底层读取
 	assert(not s.co)
 	s.co = coroutine.running()
 	if s.pause then
@@ -62,6 +67,7 @@ end
 -- read skynet_socket.h for these macro
 -- SKYNET_SOCKET_TYPE_DATA = 1
 socket_message[1] = function(id, size, data)
+	-- 数据到达：推入 buffer，根据 read_required 类型（number 行为、string 行分隔、true 读到 EOF、0 任意数据）决定是否唤醒
 	local s = socket_pool[id]
 	if s == nil then
 		skynet.error("socket: drop package from " .. id)
@@ -104,6 +110,7 @@ end
 
 -- SKYNET_SOCKET_TYPE_CONNECT = 2
 socket_message[2] = function(id, ud , addr)
+	-- 连接建立：对于监听 socket，ud/addr 会带回监听到的本地地址与端口
 	local s = socket_pool[id]
 	if s == nil then
 		return
@@ -121,6 +128,7 @@ end
 
 -- SKYNET_SOCKET_TYPE_CLOSE = 3
 socket_message[3] = function(id)
+	-- 连接关闭：唤醒等待的协程，并触发 onclose 回调
 	local s = socket_pool[id]
 	if s then
 		s.connected = false
@@ -137,6 +145,7 @@ end
 
 -- SKYNET_SOCKET_TYPE_ACCEPT = 4
 socket_message[4] = function(id, newid, addr)
+	-- 接受新连接：将新 fd 交给上层回调处理（一般配合 socket.start 使用）
 	local s = socket_pool[id]
 	if s == nil then
 		driver.close(newid)
@@ -147,6 +156,7 @@ end
 
 -- SKYNET_SOCKET_TYPE_ERROR = 5
 socket_message[5] = function(id, _, err)
+	-- 错误：关闭写端，唤醒等待，并记录错误信息
 	local s = socket_pool[id]
 	if s == nil then
 		driver.shutdown(id)
@@ -170,6 +180,7 @@ end
 
 -- SKYNET_SOCKET_TYPE_UDP = 6
 socket_message[6] = function(id, size, data, address)
+	-- UDP 数据：直接回调到上层 callback
 	local s = socket_pool[id]
 	if s == nil or s.callback == nil then
 		skynet.error("socket: drop udp package from " .. id)
@@ -208,6 +219,7 @@ skynet.register_protocol {
 }
 
 local function connect(id, func)
+	-- 将一个 fd 封装为 socket 对象：func 存在则为 accept/回调式，nil 则创建缓冲区用于主动连接
 	local newbuffer
 	if func == nil then
 		newbuffer = driver.buffer()
@@ -241,6 +253,7 @@ local function connect(id, func)
 end
 
 function socket.open(addr, port)
+	-- 主动连接 TCP 服务
 	local id = driver.connect(addr,port)
 	return connect(id)
 end
@@ -251,15 +264,18 @@ function socket.bind(os_fd)
 end
 
 function socket.stdin()
+	-- 将标准输入 0 号 fd 封装为 socket
 	return socket.bind(0)
 end
 
 function socket.start(id, func)
+	-- 启动监听 fd 的接收，func 接收 (newfd, addr) 回调
 	driver.start(id)
 	return connect(id, func)
 end
 
 function socket.pause(id)
+	-- 暂停读取，通常用于上游处理过慢的反压
 	local s = socket_pool[id]
 	if s == nil then
 		return
@@ -268,6 +284,7 @@ function socket.pause(id)
 end
 
 function socket.shutdown(id)
+	-- 半关闭（发送缓冲清空后再 close），等待 CLOSE 事件来清理资源
 	local s = socket_pool[id]
 	if s then
 		-- the framework would send SKYNET_SOCKET_TYPE_CLOSE , need close(id) later
@@ -281,6 +298,7 @@ function socket.close_fd(id)
 end
 
 function socket.close(id)
+	-- 关闭连接：若有读取协程则等待其读取缓冲区并唤醒
 	local s = socket_pool[id]
 	if s == nil then
 		return
@@ -303,6 +321,7 @@ function socket.close(id)
 end
 
 function socket.read(id, sz)
+	-- 读取 sz 字节；若 sz 为空，则尽量读出当前缓冲区
 	local s = socket_pool[id]
 	assert(s)
 	if sz == nil then
@@ -346,6 +365,7 @@ function socket.read(id, sz)
 end
 
 function socket.readall(id)
+	-- 读取直至连接关闭，返回已收集的数据；若已关闭且无数据返回 nil
 	local s = socket_pool[id]
 	assert(s)
 	if not s.connected then
@@ -360,6 +380,7 @@ function socket.readall(id)
 end
 
 function socket.readline(id, sep)
+	-- 读取一行（以分隔符 sep 结尾，默认 \n）
 	sep = sep or "\n"
 	local s = socket_pool[id]
 	assert(s)
@@ -381,6 +402,7 @@ function socket.readline(id, sep)
 end
 
 function socket.block(id)
+	-- 阻塞直到至少有数据（read_required=0），返回连接是否仍然有效
 	local s = socket_pool[id]
 	if not s or not s.connected then
 		return false
