@@ -138,6 +138,7 @@ end
 
 -- 带日志的启动
 function command.LOGLAUNCH(_, service, ...)
+    -- 需要: local core = require "skynet.core"
     local inst = launch_service(service, ...)
     if inst then
         core.command("LOGON", skynet.address(inst))
@@ -306,7 +307,7 @@ end
 ```lua
 -- lualib/skynet/manager.lua
 
--- 底层启动服务
+-- 底层启动服务（调用内核 LAUNCH 指令）
 function skynet.launch(...)
     local addr = c.command("LAUNCH", table.concat({...}, " "))
     if addr then
@@ -314,7 +315,9 @@ function skynet.launch(...)
     end
 end
 
--- 创建新服务（通过 launcher）
+-- lualib/skynet.lua
+
+-- 创建新服务（通过 .launcher 转发 LAUNCH）
 function skynet.newservice(name, ...)
     return skynet.call(".launcher", "lua", "LAUNCH", "snlua", name, ...)
 end

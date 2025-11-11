@@ -1,3 +1,9 @@
+-- 说明：
+--  snax.loginserver 实现一个带鉴权的登录服务模板：
+--   - 文本行协议（\n 分隔），使用 DH 密钥交换 + HMAC 校验 + DES 加密 token
+--   - 角色分离：master（监听入口，分发给 slave）与 slave（实际鉴权流程）
+--   - 通过传入 conf = { auth_handler, login_handler, command_handler, host, port, instance, multilogin, name }
+--     控制认证、登录回调、外部指令处理、监听参数以及并发实例数。
 local skynet = require "skynet"
 require "skynet.manager"
 local socket = require "skynet.socket"
@@ -33,6 +39,7 @@ Success:
 ]]
 
 local socket_error = {}
+-- 校验 socket 写/读结果：若失败则抛 socket_error 并打印统一错误
 local function assert_socket(service, v, fd)
 	if v then
 		return v
@@ -42,10 +49,13 @@ local function assert_socket(service, v, fd)
 	end
 end
 
+-- 可靠写：带错误包装
 local function write(service, fd, text)
 	assert_socket(service, socket.write(fd, text), fd)
 end
 
+-- 启动 slave：执行握手 + 认证流程
+-- Server 侧流程（详见文件头注释）：challenge -> exchange -> secret -> HMAC 校验 -> 解密 token -> auth_handler
 local function launch_slave(auth_handler)
 	local function auth(fd, addr)
 		-- set socket buffer limit (8K)
@@ -76,7 +86,7 @@ local function launch_slave(auth_handler)
 
 		local token = crypt.desdecode(secret, crypt.base64decode(etoken))
 
-		local ok, server, uid =  pcall(auth_handler,token)
+		local ok, server, uid =  pcall(auth_handler,token)  -- 用户自定义：解析 token，返回 server 与 uid
 
 		return ok, server, uid, secret
 	end
@@ -93,6 +103,7 @@ local function launch_slave(auth_handler)
 		end
 	end
 
+	-- 将鉴权过程包装为可返回给 master 的二进制包（skynet.pack）
 	local function auth_fd(fd, addr)
 		skynet.error(string.format("connect from %s (fd = %d)", addr, fd))
 		socket.start(fd)	-- may raise error here
@@ -111,8 +122,13 @@ local function launch_slave(auth_handler)
 	end)
 end
 
+-- 记录 uid 是否已登录（当 multilogin=false 时禁止重复登录）
 local user_login = {}
 
+-- master 接入处理：
+--  1) 调用 slave 鉴权（auth_handler）获得 server, uid, secret
+--  2) 根据 multilogin 判重（禁止重复登录）
+--  3) 调用 login_handler(server, uid, secret) 返回 subid（返回给客户端）
 local function accept(conf, s, fd, addr)
 	-- call slave auth
 	local ok, server, uid, secret = skynet.call(s, "lua",  fd, addr)
@@ -147,6 +163,7 @@ local function accept(conf, s, fd, addr)
 	end
 end
 
+-- 启动 master：监听入口端口，将每个连接分发给一个 slave 完成鉴权与登录
 local function launch_master(conf)
 	local instance = conf.instance or 8
 	assert(instance > 0)
@@ -181,6 +198,7 @@ local function launch_master(conf)
 	end)
 end
 
+-- 入口：根据 conf.name 判定是否已存在 master 实例，若存在则作为 slave 运行，否则作为 master 注册并监听
 local function login(conf)
 	local name = "." .. (conf.name or "login")
 	skynet.start(function()

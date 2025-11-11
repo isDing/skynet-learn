@@ -1,5 +1,12 @@
+-- 说明：
+--  snax.interface 负责解析 Snax 服务的接口定义文件（accept/response/system），
+--  生成一个方法描述表 func 及用于定位源码的 pattern。
+--  调用方式：
+--    local func, pattern = snax_interface(name, _ENV, optional_loader)
+--  其中 func 是形如 { {id, group, name, func}, ... } 的数组，group ∈ {"system","accept","response"}
 local skynet = require "skynet"
 
+-- 默认加载器：在 snax 路径下按 "?" 替换为 name 依次查找并 loadfile
 local function dft_loader(path, name, G)
 	local errlist = {}
 
@@ -19,6 +26,7 @@ end
 return function (name , G, loader)
 	loader = loader or dft_loader
 
+	-- 构造一个方法登记器：写入 accept/response 时分配自增 id
 	local function func_id(id, group)
 		local tmp = {}
 		local function count( _, name, func)
@@ -58,6 +66,7 @@ return function (name , G, loader)
 		end
 	end
 
+	-- 通过 __newindex 捕获 accept.* / response.* 的定义
 	env.accept = func_id(func, "accept")
 	env.response = func_id(func, "response")
 
@@ -76,6 +85,8 @@ return function (name , G, loader)
 	local path = assert(skynet.getenv "snax" , "please set snax in config file")
 	local mainfunc, pattern = loader(path, name, G)
 
+	-- 将 G 的 __index 指向 env（包含 accept/response 登记器），
+	-- 将 __newindex 指向 init_system（捕获 system 方法及其他全局符号）
 	setmetatable(G,	{ __index = env , __newindex = init_system })
 	local ok, err = xpcall(mainfunc, debug.traceback)
 	setmetatable(G, nil)
@@ -85,5 +96,6 @@ return function (name , G, loader)
 		G[k] = v
 	end
 
+	-- 返回方法描述数组 func 以及匹配到的路径 pattern（用于定位源码）
 	return func, pattern
 end

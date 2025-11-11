@@ -1090,6 +1090,9 @@ function skynet.newservice(name, ...)
 	return skynet.call(".launcher", "lua" , "LAUNCH", "snlua", name, ...)
 end
 
+-- 启动/获取唯一服务：
+--  global=true 表示全局唯一（跨节点，委托 .service 的 GLAUNCH）
+--  否则为本地唯一（委托 .service 的 LAUNCH）
 function skynet.uniqueservice(global, ...)
 	if global == true then
 		return assert(skynet.call(".service", "lua", "GLAUNCH", ...))
@@ -1098,6 +1101,8 @@ function skynet.uniqueservice(global, ...)
 	end
 end
 
+-- 查询唯一服务（不触发创建）：
+--  若目标正在启动/已存在：等待/返回地址；若曾失败：抛错；无内置超时
 function skynet.queryservice(global, ...)
 	if global == true then
 		return assert(skynet.call(".service", "lua", "GQUERY", ...))

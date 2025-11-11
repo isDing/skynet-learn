@@ -215,7 +215,9 @@ local sync = skynet.uniqueservice(true, "data_sync")
 -- sync服务可能运行在集群的任意节点上
 
 -- 示例：全局配置服务
-local config = skynet.globalservice("config_center")
+local config = skynet.uniqueservice(true, "config_center")
+-- 或仅查询（不触发创建）：
+-- local config = skynet.queryservice(true, "config_center")
 -- 所有节点共享同一个配置中心
 ```
 
@@ -529,7 +531,8 @@ end
 **查询策略：**
 - **本地优先**：先查询本节点服务
 - **延迟创建**：查询不会创建新服务
-- **错误处理**：服务不存在时报错
+- **等待行为**：若服务尚未创建，`queryservice` 会挂起等待，直至该服务由其他请求启动
+- **错误处理**：仅当该服务曾尝试启动且记录为失败时才会抛错；无内置超时机制
 
 ### 5.2 服务缓存策略
 
