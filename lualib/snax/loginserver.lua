@@ -135,6 +135,10 @@ local user_login = {}
 --  1) 调用 slave 鉴权（auth_handler）获得 server, uid, secret
 --  2) 根据 multilogin 判重（禁止重复登录）
 --  3) 调用 login_handler(server, uid, secret) 返回 subid（返回给客户端）
+-- 接入一个客户端连接：
+--  1) 将 fd 交给某个 slave 做握手/认证（auth_handler）
+--  2) 如果 multilogin=false，使用 user_login 表阻止同一 uid 并发登录，返回 406
+--  3) 调用 login_handler(server, uid, secret) 进行业务登录，成功返回 subid（写回 200 base64(subid)）
 local function accept(conf, s, fd, addr)
 	-- call slave auth
 	local ok, server, uid, secret = skynet.call(s, "lua",  fd, addr)
@@ -172,6 +176,9 @@ local function accept(conf, s, fd, addr)
 end
 
 -- 启动 master：监听入口端口，将每个连接分发给一个 slave 完成鉴权与登录
+-- 启动 master：
+--  - 预创建 conf.instance 个 slave；每次新连接轮询分配一个 slave 做鉴权
+--  - master 自身仅负责监听、调度与组装响应（401/403/406/200）
 local function launch_master(conf)
 	local instance = conf.instance or 8
 	assert(instance > 0)

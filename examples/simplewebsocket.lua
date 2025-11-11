@@ -1,3 +1,9 @@
+-- 说明：
+--  WebSocket 示例：
+--   - server：监听 9948，接受客户端连接；每个连接由 agent（本文件 MODE=agent）处理
+--   - agent：通过 http.websocket.accept 完成握手，处理 message/ping/pong/close 事件
+--   - client：使用 http.websocket.connect 连接本地 server，发送 echo 并主动发 ping
+--  目标：展示 http.websocket 的最小服务端/客户端用法与 API 路径（read/write/ping/close）
 local skynet = require "skynet"
 local socket = require "skynet.socket"
 local service = require "skynet.service"
@@ -22,6 +28,7 @@ if MODE == "agent" then
     end
 
     function handle.message(id, msg, msg_type)
+        -- echo：将收到的 payload 原样写回
         assert(msg_type == "binary" or msg_type == "text")
         websocket.write(id, msg)
     end
@@ -90,6 +97,7 @@ else
             end
         end)
         -- test echo client
+        -- 启动一个内部 echo 客户端（便于自测）
         service.new("websocket_echo_client", simple_echo_client_service, protocol)
     end)
 end

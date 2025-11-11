@@ -1,3 +1,8 @@
+-- 说明：
+--  登录客户端示例：
+--   1) 连接登录 master（127.0.0.1:8001），完成 DH 握手 + HMAC 校验 + DES 加密 token
+--   2) 收到 200 base64(subid) 后，使用 subid + secret 与 game gate（:8888）握手
+--   3) 发送两次请求演示会话与重放
 package.cpath = "luaclib/?.so"
 
 local socket = require "client.socket"
@@ -54,14 +59,17 @@ end
 
 local readline = unpack_f(unpack_line)
 
+-- 登录阶段 1：服务端发来 base64(8byte challenge)
 local challenge = crypt.base64decode(readline())
 
+-- 登录阶段 2：客户端发出 base64(DH 交换值)，并收到服务端交换值后计算 secret
 local clientkey = crypt.randomkey()
 writeline(fd, crypt.base64encode(crypt.dhexchange(clientkey)))
 local secret = crypt.dhsecret(crypt.base64decode(readline()), clientkey)
 
 print("sceret is ", crypt.hexencode(secret))
 
+-- 登录阶段 3：发送 base64(HMAC(challenge, secret))
 local hmac = crypt.hmac64(challenge, secret)
 writeline(fd, crypt.base64encode(hmac))
 
@@ -78,6 +86,7 @@ local function encode_token(token)
 		crypt.base64encode(token.pass))
 end
 
+-- 登录阶段 4：发送 DES(secret, base64(token))
 local etoken = crypt.desencode(secret, encode_token(token))
 writeline(fd, crypt.base64encode(etoken))
 
@@ -87,12 +96,13 @@ local code = tonumber(string.sub(result, 1, 3))
 assert(code == 200)
 socket.close(fd)
 
-local subid = crypt.base64decode(string.sub(result, 5))
+local subid = crypt.base64decode(string.sub(result, 5))  -- 业务 subid（字符串/数字皆可）
 
 print("login ok, subid=", subid)
 
 ----- connect to game server
 
+-- game gate 协议：([2B len][payload][1B ok?][4B session])，详见 examples 实现
 local function send_request(v, session)
 	local size = #v + 4
 	local package = string.pack(">I2", size)..v..string.pack(">I4", session)
@@ -106,6 +116,7 @@ local function recv_response(v)
 	return ok ~=0 , content, session
 end
 
+-- 解包 2 字节帧长的回应
 local function unpack_package(text)
 	local size = #text
 	if size < 2 then
@@ -167,4 +178,3 @@ print("<===",recv_response(readpackage()))
 
 print("disconnect")
 socket.close(fd)
-

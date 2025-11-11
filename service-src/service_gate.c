@@ -1,3 +1,16 @@
+// 说明（系统级 C 服务：gate）
+//
+// 职责：
+//  - 监听 TCP 端口，维护 fd→connection 映射
+//  - 基于 2/4 字节长度头（大端序）做应用层分包（databuffer_*）
+//  - 将完整包转发给 broker/agent/watchdog
+//  - 通过 PTYPE_TEXT 控制命令（kick/forward/start/broker/close）管理连接/行为
+//
+// 注意：
+//  - forward 仅建立 fd→agent 映射，不启动读取；需配合 "start <fd>" 显式开启
+//  - watchdog 文本通告格式："<fd> open <fd> <ip>:0"、"<fd> close"
+//  - PTYPE_CLIENT 方向（向客户端写）通过在消息末尾附加 4 字节 uid（见 _cb）
+
 #include "skynet.h"
 #include "skynet_socket.h"
 #include "databuffer.h"
@@ -126,6 +139,7 @@ _ctrl(struct gate * g, const void * msg, int sz) {
 		uint32_t agent_handle = strtoul(agent+1, NULL, 16);
 		uint32_t client_handle = strtoul(client+1, NULL, 16);
 		_forward_agent(g, id, agent_handle, client_handle);
+		// 注意：此处不调用 start；应由外部再发一条 "start <fd>" 开启读
 		return;
 	}
 	if (memcmp(command,"broker",i)==0) {
@@ -227,6 +241,7 @@ dispatch_socket_message(struct gate *g, const struct skynet_socket_message * mes
 	struct skynet_context * ctx = g->ctx;
 	switch(message->type) {
 	case SKYNET_SOCKET_TYPE_DATA: {
+		// 客户端数据：写入 databuffer 并根据 header 拆包后转发
 		int id = hashid_lookup(&g->hash, message->id);
 		if (id>=0) {
 			struct connection *c = &g->conn[id];
@@ -239,6 +254,7 @@ dispatch_socket_message(struct gate *g, const struct skynet_socket_message * mes
 		break;
 	}
 	case SKYNET_SOCKET_TYPE_CONNECT: {
+		// 连接建立确认：监听 fd 会首先收到 CONNECT，忽略即可
 		if (message->id == g->listen_id) {
 			// start listening
 			break;
@@ -252,6 +268,7 @@ dispatch_socket_message(struct gate *g, const struct skynet_socket_message * mes
 	}
 	case SKYNET_SOCKET_TYPE_CLOSE:
 	case SKYNET_SOCKET_TYPE_ERROR: {
+		// 连接关闭/错误：移除映射，清理缓冲，并通知 watchdog
 		int id = hashid_remove(&g->hash, message->id);
 		if (id>=0) {
 			struct connection *c = &g->conn[id];
@@ -265,6 +282,7 @@ dispatch_socket_message(struct gate *g, const struct skynet_socket_message * mes
 	}
 	case SKYNET_SOCKET_TYPE_ACCEPT:
 		// report accept, then it will be get a SKYNET_SOCKET_TYPE_CONNECT message
+		// 新连接：插入映射并上报 open 文本；随后会收到 CONNECT 确认
 		assert(g->listen_id == message->id);
 		if (hashid_full(&g->hash)) {
 			skynet_socket_close(ctx, message->ud);
@@ -281,6 +299,7 @@ dispatch_socket_message(struct gate *g, const struct skynet_socket_message * mes
 		}
 		break;
 	case SKYNET_SOCKET_TYPE_WARNING:
+		// 发送缓冲区积压告警（单位 KB）
 		skynet_error(ctx, "fd (%d) send buffer (%d)K", message->id, message->ud);
 		break;
 	}
@@ -359,6 +378,7 @@ gate_init(struct gate *g , struct skynet_context * ctx, char * parm) {
 	char binding[sz];
 	int client_tag = 0;
 	char header;
+	// 参数格式："<header> <watchdog> <host:port> <client_tag> <max>"
 	int n = sscanf(parm, "%c %s %s %d %d", &header, watchdog, binding, &client_tag, &max);
 	if (n<4) {
 		skynet_error(ctx, "Invalid gate parm %s",parm);
@@ -398,6 +418,7 @@ gate_init(struct gate *g , struct skynet_context * ctx, char * parm) {
 	}
 	
 	g->client_tag = client_tag;
+	// header : 'S' -> 2 字节，大端；'L' -> 4 字节，大端
 	g->header_size = header=='S' ? 2 : 4;
 
 	skynet_callback(ctx,g,_cb);

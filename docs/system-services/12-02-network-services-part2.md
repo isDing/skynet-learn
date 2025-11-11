@@ -265,38 +265,42 @@ WebSocket提供了全双工的通信通道，适用于实时应用如游戏、�
 
 **文件位置**: `lualib/http/websocket.lua`
 
-#### 握手过程
+#### 握手过程（客户端）
 
 ```lua
--- 客户端握手请求
+-- 关键要点（对应 lualib/http/websocket.lua）：
+-- 1) 生成随机 Sec-WebSocket-Key，发送 GET + Upgrade 请求
+-- 2) 检查响应码 101，Upgrade=websocket，Connection=upgrade
+-- 3) 校验 Sec-WebSocket-Accept == base64(sha1(Key .. GUID))
+
 local function write_handshake(self, host, url, header)
-    -- 生成随机key
-    local key = crypt.base64encode(crypt.randomkey()..crypt.randomkey())
-    
-    local request_header = {
-        ["Upgrade"] = "websocket",
-        ["Connection"] = "Upgrade",
-        ["Sec-WebSocket-Version"] = "13",
-        ["Sec-WebSocket-Key"] = key
-    }
-    
-    -- 发送HTTP请求
-    local code, payload = internal.request(self, "GET", 
-                                          host, url, 
-                                          recvheader, 
-                                          request_header)
-    
-    -- 验证响应码
-    if code ~= 101 then
-        error(string.format("websocket handshake error: %s", code))
+  local key = crypt.base64encode(crypt.randomkey()..crypt.randomkey())
+  local request_header = {
+    ["Upgrade"] = "websocket",
+    ["Connection"] = "Upgrade",
+    ["Sec-WebSocket-Version"] = "13",
+    ["Sec-WebSocket-Key"] = key,
+  }
+  if header then
+    for k,v in pairs(header) do
+      assert(request_header[k] == nil, k)
+      request_header[k] = v
     end
-    
-    -- 验证Accept key
-    local sw_key = recvheader["sec-websocket-accept"]
-    sw_key = crypt.base64decode(sw_key)
-    if sw_key ~= crypt.sha1(key .. GLOBAL_GUID) then
-        error("invalid Sec-WebSocket-Accept")
-    end
+  end
+
+  local recvheader = {}
+  local code, payload = internal.request(self, "GET", host, url, recvheader, request_header)
+  if code ~= 101 then error(string.format("websocket handshake error: %s", code)) end
+  -- 将 payload 注入 read，以无缝继续后续读取
+  -- reader_with_payload(self, payload)
+
+  assert(recvheader["upgrade"] and recvheader["upgrade"]:lower()=="websocket")
+  assert(recvheader["connection"] and recvheader["connection"]:lower()=="upgrade")
+  local sw_key = assert(recvheader["sec-websocket-accept"])  -- base64(sha1(Key..GUID))
+  sw_key = crypt.base64decode(sw_key)
+  if sw_key ~= crypt.sha1(key .. self.guid) then
+    error("websocket handshake invalid Sec-WebSocket-Accept")
+  end
 end
 ```
 
@@ -323,53 +327,35 @@ end
  +---------------------------------------------------------------+
 ```
 
-#### 帧解析
+#### 帧解析（服务端/客户端通用）
 
 ```lua
-local function read_frame(self, force_masking)
-    local frame = self.read(2)
-    
-    local op, fin, mask = string.unpack("BB", frame)
-    
-    -- 解析标志位
-    fin = op & 0x80 ~= 0
-    op = op & 0x0f
-    mask = mask & 0x80 ~= 0
-    local payload_len = mask & 0x7f
-    
-    -- 检查masking
-    if force_masking and not mask then
-        error("frame must be mask")
-    end
-    
-    -- 读取扩展长度
-    if payload_len == 126 then
-        payload_len = string.unpack(">H", self.read(2))
-    elseif payload_len == 127 then
-        payload_len = string.unpack(">I8", self.read(8))
-    end
-    
-    -- 检查大小限制
-    if payload_len > MAX_FRAME_SIZE then
-        error("payload too large")
-    end
-    
-    -- 读取masking key
-    local masking_key = mask and self.read(4) or false
-    
-    -- 读取payload
-    local payload = payload_len > 0 and self.read(payload_len) or ""
-    
-    -- 解码masking
-    if mask then
-        payload = crypt.xor_str(payload, masking_key)
-    end
-    
-    return fin, op, payload
+-- 摘要：读取 2 字节基本头，解析 FIN/op/mask/len；按需读取扩展长度/掩码/负载并解码
+local function read_frame(self)
+  local s = self.read(2)
+  local v1, v2 = string.unpack("I1I1", s)
+  local fin  = (v1 & 0x80) ~= 0
+  local op   =  v1 & 0x0f
+  local mask = (v2 & 0x80) ~= 0
+  local payload_len = (v2 & 0x7f)
+  if payload_len == 126 then
+    s = self.read(2)
+    payload_len = string.unpack(">I2", s)
+  elseif payload_len == 127 then
+    s = self.read(8)
+    payload_len = string.unpack(">I8", s)
+  end
+  if self.mode == "server" and payload_len > MAX_FRAME_SIZE then
+    error("payload_len is too large")
+  end
+  local masking_key = mask and self.read(4) or false
+  local payload = payload_len>0 and self.read(payload_len) or ""
+  payload = masking_key and crypt.xor_str(payload, masking_key) or payload
+  return fin, op, payload
 end
 ```
 
-#### 消息类型
+#### 消息类型与 Mask（客户端必需）
 
 ```lua
 local op_code = {
@@ -382,33 +368,28 @@ local op_code = {
 }
 
 -- 发送消息
-local function write_frame(self, op, payload, masking)
-    -- 构建帧头
-    local op_v = op_code[op]
-    local fin = 0x80  -- FIN=1
-    local mask = masking and 0x80 or 0x00
-    
-    local frame = string.pack("B", fin | op_v)
-    
-    -- 处理payload长度
-    local payload_len = #payload
-    if payload_len < 126 then
-        frame = frame .. string.pack("B", mask | payload_len)
-    elseif payload_len < 0xffff then
-        frame = frame .. string.pack("B>H", mask | 126, payload_len)
-    else
-        frame = frame .. string.pack("B>I8", mask | 127, payload_len)
-    end
-    
-    -- 添加masking
-    if masking then
-        local masking_key = crypt.randomkey()
-        frame = frame .. masking_key:sub(1,4)
-        payload = crypt.xor_str(payload, masking_key)
-    end
-    
-    -- 发送帧
-    self.write(frame .. payload)
+local function write_frame(self, op, payload, masking_key)
+  local payload_len = #payload
+  local op_v = op_code[op]
+  local v1 = 0x80 | op_v -- FIN=1
+  local mask = masking_key and 0x80 or 0x00
+  local head
+  if payload_len < 126 then
+    head = string.pack("I1I1", v1, mask | payload_len)
+  elseif payload_len <= 0xffff then
+    head = string.pack("I1I1>I2", v1, mask | 126, payload_len)
+  else
+    head = string.pack("I1I1>I8", v1, mask | 127, payload_len)
+  end
+  self.write(head)
+  if masking_key then
+    local key = string.pack(">I4", masking_key)
+    self.write(key)
+    payload = crypt.xor_str(payload, key)
+  end
+  if payload_len > 0 then
+    self.write(payload)
+  end
 end
 ```
 
@@ -713,30 +694,22 @@ skynet.start(function()
 end)
 ```
 
-#### RESTful API服务器
+#### RESTful API服务器（示例，参考 examples/simpleweb.lua）
 
 ```lua
 local skynet = require "skynet"
-local json = require "json"
+-- 注意：本示例为演示用途，未附带 JSON 库（可选用 cjson/rapidjson 等）
 
 -- 路由表
 local routes = {}
 
 -- GET /users
-routes["GET /users"] = function(query, header, body)
-    local users = db.query("SELECT * FROM users")
-    return 200, json.encode(users)
+routes["GET /hello"] = function(query, header, body)
+    return 200, "{\"hello\":\"world\"}"
 end
 
 -- GET /users/:id
-routes["GET /users/:id"] = function(query, header, body, id)
-    local user = db.query("SELECT * FROM users WHERE id=?", id)
-    if user then
-        return 200, json.encode(user)
-    else
-        return 404, json.encode({error = "User not found"})
-    end
-end
+-- 省略：其余 CRUD 路由可按需实现
 
 -- POST /users
 routes["POST /users"] = function(query, header, body)
@@ -804,7 +777,7 @@ end
 -- 请求处理
 local function handle_request(id, addr)
     local code, url, method, header, body = httpd.read_request(
-        sockethelper.readfunc(id), 1024*1024)  -- 1MB limit
+        sockethelper.readfunc(id), 1024*1024)  -- 1MB 上限
     
     if code == 200 then
         local path, query = urllib.parse(url)
@@ -825,8 +798,8 @@ local function handle_request(id, addr)
                     status, result, response_header)
         else
             response(id, sockethelper.writefunc(id), 404,
-                    json.encode({error = "Not Found"}),
-                    {["content-type"] = "application/json"})
+                    "{\"error\":\"Not Found\"}",
+                    { ["content-type"] = "application/json" })
         end
     else
         response(id, sockethelper.writefunc(id), code or 400)
@@ -841,22 +814,26 @@ end
 ```lua
 local httpc = require "http.httpc"
 
--- GET请求
-local status, body = httpc.get("www.example.com", "/api/users")
+-- 基本请求（host 可省略协议，默认 http）
+local code, body = httpc.get("example.com", "/api/users")
 
--- POST请求
-local status, body = httpc.post("www.example.com", "/api/users",
-    {["content-type"] = "application/json"},
-    json.encode({name = "Alice", age = 25}))
+-- x-www-form-urlencoded 快捷 POST：form = k/v 表
+local code, body = httpc.post("https://example.com", "/api/users", { name = "Alice", age = 25 })
 
--- 带超时的请求
-local status, body = httpc.request("GET", "www.example.com", "/api/data",
-    {}, "",  -- header和body
-    {timeout = 5000})  -- 5秒超时
+-- 自定义方法 + 头部/内容
+local recvheader = {}
+local header = { ["content-type"] = "application/json" }
+local content = "{\"a\":1}"
+httpc.timeout = 5000   -- 全局超时（厘秒），按需设置
+local code, body = httpc.request("GET", "https://example.com", "/api/data", recvheader, header, content)
 
--- HTTPS请求
-local status, body = httpc.request("GET", "www.example.com", "/api/secure",
-    {}, "", {protocol = "https"})
+-- 流式响应（大文件友好；调用方需在合适时机关闭）
+local stream = httpc.request_stream("GET", "https://example.com", "/bigfile")
+for chunk in stream do
+  if not chunk then break end
+  -- 处理分块
+end
+stream:close()
 ```
 
 ---
@@ -920,28 +897,20 @@ end
 
 -- 编码消息
 function ProtocolHandler:encode(msg_type, msg)
-    local encoder = self.encoders[msg_type]
-    if not encoder then
-        error("Unknown message type: " .. msg_type)
-    end
-    
-    local data = encoder(msg)
-    local msg_id = MSG_ID[msg_type]
-    
-    -- 添加消息头
-    return string.pack(">HH", #data + 2, msg_id) .. data
+  local encoder = assert(self.encoders[msg_type], "Unknown message type")
+  local data = encoder(msg)
+  local msg_id = assert(MSG_ID[msg_type], "Unknown msg id")
+  -- 头部示例：2 字节长度 + 2 字节消息 ID（大端）
+  return string.pack(">I2I2", #data, msg_id) .. data
 end
 
 -- 解码消息
 function ProtocolHandler:decode(data)
-    local msg_id, body = string.unpack(">Hs2", data)
-    
-    local decoder = self.decoders[msg_id]
-    if not decoder then
-        error("Unknown message id: " .. msg_id)
-    end
-    
-    return decoder(body)
+  -- 解包：读取 2 字节长度与 2 字节消息 ID，然后按长度截取 body
+  local len, msg_id = string.unpack(">I2I2", data)
+  local body = data:sub(1 + 2 + 2, 1 + 2 + 2 + len)
+  local decoder = assert(self.decoders[msg_id], "Unknown message id")
+  return decoder(body)
 end
 
 -- 处理消息
@@ -999,6 +968,7 @@ end)
 ### JSON-RPC协议
 
 ```lua
+-- 注意：需自备 JSON 库（如 cjson/rapidjson 等）
 local json = require "json"
 
 local jsonrpc_handler = {}

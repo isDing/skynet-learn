@@ -202,51 +202,25 @@ struct gate {
 #### 1. 监听端口
 
 ```c
-// 处理"listen"命令
-static void _listen(struct gate *g, char * addr, int port, int backlog) {
-    struct skynet_context * ctx = g->ctx;
-    
-    // 创建监听socket
-    int listen_fd = skynet_socket_listen(ctx, addr, port, backlog);
-    if (listen_fd < 0) {
-        skynet_error(ctx, "Listen error");
-        return;
-    }
-    
-    g->listen_id = listen_fd;
-    skynet_socket_start(ctx, listen_fd);
+// 初始化阶段完成监听（gate_init -> start_listen），非控制命令触发
+static int start_listen(struct gate *g, char * listen_addr) {
+    // 解析 host:port，调用 skynet_socket_listen 并 skynet_socket_start
+}
+
+int gate_init(struct gate *g , struct skynet_context * ctx, char * parm) {
+    // 解析参数 header/watchdog/binding/client_tag/max 等
+    // 初始化 hash/conn/mp 并注册回调 _cb
+    return start_listen(g, binding);
 }
 ```
 
 #### 2. 接受连接
 
 ```c
-// Socket回调：新连接
-static void _accept(struct gate *g, int listen_fd, int client_fd, 
-                   char * remote_addr) {
-    struct skynet_context * ctx = g->ctx;
-    
-    // 检查连接数限制
-    if (g->client_count >= g->max_connection) {
-        skynet_socket_close(ctx, client_fd);
-        return;
-    }
-    
-    // 分配连接结构
-    int index = hashid_insert(&g->hash, client_fd);
-    struct connection * c = &g->conn[index];
-    
-    c->id = client_fd;
-    c->agent = 0;
-    c->client = 0;
-    memcpy(c->remote_name, remote_addr, 32);
-    databuffer_init(&c->buffer, &g->mp);
-    
-    // 通知watchdog
-    _report(g, "%d open %d %s", client_fd, client_fd, remote_addr);
-    
-    // 暂不启动socket读取，等待forward命令
-}
+// Socket回调：SKYNET_SOCKET_TYPE_ACCEPT（见 dispatch_socket_message）
+// - 若连接已满（hashid_full），关闭新 fd；否则插入映射表，记录 remote_name
+// - 通过 _report 以 PTYPE_TEXT 发送 "<fd> open <fd> <ip>:0" 给 watchdog
+// - 是否开始读取由后续“start <fd>”控制命令决定
 ```
 
 #### 3. 消息转发
@@ -295,12 +269,9 @@ static void _forward(struct gate *g, struct connection * c, int size) {
 ```c
 static void dispatch_message(struct gate *g, struct connection *c, 
                             int id, void * data, int sz) {
-    // 将数据推入缓冲区
-    databuffer_push(&c->buffer, &g->mp, data, sz);
-    
-    // 循环处理完整的数据包
+    // 将数据推入缓冲区并循环处理完整的数据包
     for (;;) {
-        // 读取消息头，获取消息大小
+        // 读取消息头，获取消息大小（2/4 字节）
         int size = databuffer_readheader(&c->buffer, &g->mp, 
                                         g->header_size);
         if (size < 0) {
@@ -308,12 +279,8 @@ static void dispatch_message(struct gate *g, struct connection *c,
         }
         
         if (size > 0) {
-            // 处理边界检查
-            if (c->buffer.size < size) {
-                return;  // 数据体不完整
-            }
-            
-            // 转发完整的消息
+            // 超大包（>=16MB）将直接清空缓冲并关闭连接，见源码实现
+            // 正常情况：转发完整的消息并 databuffer_reset 重置已读头
             _forward(g, c, size);
         }
     }
@@ -360,9 +327,7 @@ static void _ctrl(struct gate * g, const void * msg, int sz) {
         uint32_t agent_handle = strtoul(agent+1, NULL, 16);
         uint32_t client_handle = strtoul(client+1, NULL, 16);
         _forward_agent(g, fd, agent_handle, client_handle);
-        
-        // 启动socket读取
-        skynet_socket_start(ctx, fd);
+        // 注意：forward 仅设置映射，不启动读取；应配合 "start <fd>" 单独开启
         return;
     }
     
@@ -411,23 +376,8 @@ uint32_t size;  // 消息体大小
 
 #### 2. 自定义协议
 
-通过header_size参数可以自定义消息头：
-
-```lua
--- 配置2字节头
-gate.open(watchdog, {
-    address = "0.0.0.0",
-    port = 8888,
-    header = 2,  -- 2字节消息头
-})
-
--- 配置4字节头
-gate.open(watchdog, {
-    address = "0.0.0.0",
-    port = 8888,
-    header = 4,  -- 4字节消息头
-})
-```
+- C 层 gate：在 gate_init 的参数首字符指定 header 风格，`'S'` 表示 2 字节，`'L'` 表示 4 字节；内部使用大端序。
+- Lua 层 gateserver：使用 `skynet.netpack` 的 2 字节长度帧（大端）作为默认分包协议，不提供动态 header 配置。
 
 ---
 
@@ -566,16 +516,17 @@ connection[fd] = {
 #### 3. 协议注册
 
 ```lua
--- 注册client协议，用于接收客户端消息
+-- 推荐在 Agent 中注册 client 协议，直接处理 PTYPE_CLIENT 数据
 skynet.register_protocol {
-    name = "client",
-    id = skynet.PTYPE_CLIENT,
+  name = "client",
+  id = skynet.PTYPE_CLIENT,
+  unpack = function (msg, sz)
+    -- 例如：return host:dispatch(msg, sz)
+  end,
+  dispatch = function (fd, _, type, ...)
+    -- 处理 REQUEST/RESPONSE
+  end,
 }
-
--- Agent服务需要处理client协议
-skynet.dispatch("client", function(_, _, fd, msg)
-    -- 处理客户端消息
-end)
 ```
 
 ---
@@ -990,8 +941,7 @@ function CMD.auth_success(source, fd)
     local status = auth_status[fd]
     if status then
         status.authed = true
-        -- 取消超时定时器
-        skynet.unregister_timeout(status.timeout)
+        -- 无需取消 skynet.timeout（不可撤销），通过状态位使其回调成为空操作
         
         -- 绑定到Agent
         local agent = create_agent()
@@ -1000,7 +950,7 @@ function CMD.auth_success(source, fd)
 end
 ```
 
-### 连接保活
+### 连接保活（示例策略）
 
 ```lua
 -- 心跳检测
@@ -1013,7 +963,7 @@ function start_heartbeat_check()
             
             local now = skynet.now()
             for fd, last_time in pairs(heartbeat) do
-                if now - last_time > 3000 then  -- 30秒无心跳
+                if now - last_time > 3000 then  -- 30秒无心跳（示例阈值）
                     skynet.error("Heartbeat timeout:", fd)
                     gateserver.closeclient(fd)
                     heartbeat[fd] = nil
@@ -1028,18 +978,17 @@ function on_heartbeat(fd)
 end
 ```
 
-### 流量控制
+### 流量控制（示例策略）
 
 ```lua
 -- 发送缓冲区监控
 function handler.warning(fd, size)
     skynet.error("Send buffer warning:", fd, size, "KB")
     
-    if size > 1024 then  -- 超过1MB
-        -- 标记为慢速客户端
-        mark_slow_client(fd)
+    if size > 1024 then  -- 超过1MB（示例阈值）
+        -- 可在此标记为慢速客户端（示例：记录并降权）
         
-        if size > 5120 then  -- 超过5MB
+        if size > 5120 then  -- 超过5MB（示例阈值）
             -- 强制断开
             skynet.error("Force disconnect slow client:", fd)
             gateserver.closeclient(fd)
@@ -1075,7 +1024,7 @@ function check_rate_limit(fd)
 end
 ```
 
-### 连接分组
+### 连接分组（示例策略）
 
 ```lua
 -- 按类型分组管理

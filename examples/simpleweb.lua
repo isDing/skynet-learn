@@ -1,3 +1,7 @@
+-- 说明：一个最小可运行的 HTTP/HTTPS 服务示例：
+--  - 主服务监听 8001 端口，将连接分发给多个 "agent"
+--  - agent 读取一次 HTTP 请求并写回响应（支持 http/https）
+--  - https 需准备 server-cert.pem/server-key.pem 或通过 certfile/keyfile 环境变量配置
 local skynet = require "skynet"
 local socket = require "skynet.socket"
 local httpd = require "http.httpd"
@@ -60,6 +64,7 @@ skynet.start(function()
 			interface.init()
 		end
 		-- limit request body size to 8192 (you can pass nil to unlimit)
+		-- 限制请求体最大 8192 字节（传 nil 表示不限制）
 		local code, url, method, header, body = httpd.read_request(interface.read, 8192)
 		if code then
 			if code ~= 200 then
