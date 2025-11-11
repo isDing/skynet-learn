@@ -143,22 +143,19 @@ end
 远程服务的本地代理：
 
 ```lua
+-- 说明：实际实现见 service/clusterproxy.lua，使用 skynet.forward_type 将 lua/snax 映射到 system 协议，
+--       然后统一交给 clusterd 的 sender 转发。此处仅示意主要结构，省略细节。
 local node, address = ...
-
 skynet.forward_type(forward_map, function()
-    local clusterd = skynet.uniqueservice("clusterd")
-    local sender = skynet.call(clusterd, "lua", "sender", node)
-    
-    skynet.dispatch("system", function(session, source, msg, sz)
-        if session == 0 then
-            -- 推送消息
-            skynet.send(sender, "lua", "push", address, msg, sz)
-        else
-            -- 请求消息
-            skynet.ret(skynet.rawcall(sender, "lua", 
-                      skynet.pack("req", address, msg, sz)))
-        end
-    end)
+  local clusterd = skynet.uniqueservice("clusterd")
+  local sender = skynet.call(clusterd, "lua", "sender", node)
+  skynet.dispatch("system", function(session, source, msg, sz)
+    if session == 0 then
+      skynet.send(sender, "lua", "push", address, msg, sz)
+    else
+      skynet.ret(skynet.rawcall(sender, "lua", skynet.pack("req", address, msg, sz)))
+    end
+  end)
 end)
 ```
 
@@ -374,37 +371,23 @@ ClusterSender                               ClusterAgent
                      Response
 ```
 
-### 请求打包与解包
+### 请求打包与解包（摘要）
 
 ```lua
--- cluster.core 协议处理
+-- 由 cluster.core 提供底层协议编解码，下面为行为摘要（非二进制细节）：
 
--- 打包请求
-function cluster.packrequest(addr, session, msg, sz)
-    -- 请求格式：
-    -- [2字节长度][会话ID][目标地址][消息内容]
-    local header = string.pack(">I2I4I4", sz + 8, session, addr)
-    
-    -- 处理大消息分片
-    if sz > 0x8000 then
-        -- 分片发送
-        local padding = sz - 0x8000
-        return {header, msg}, session + 1, padding
-    else
-        return header .. msg, session + 1, false
-    end
-end
+-- 打包请求：可能返回 string（单帧）或 table（多帧分片），并给出新会话号与是否存在后续分片
+local req, new_session, padding = cluster.packrequest(addr, session, msg, sz)
 
--- 解包响应
-function cluster.unpackresponse(msg)
-    local session, ok, data, padding = string.unpack(">I4Bs4", msg)
-    
-    if ok then
-        return session, true, data, padding
-    else
-        return session, false, data, false
-    end
-end
+-- 打包推送：同上，但无响应；对于大消息可能需要多次 request(..., nil, padding)
+local req, new_session, padding = cluster.packpush(addr, session, msg, sz)
+
+-- 解包响应：返回 (session, ok, data, padding)
+local session, ok, data, padding = cluster.unpackresponse(resp)
+
+-- 说明：
+--  - clustersender 使用 socketchannel:request(req, session, padding) 发送，处理分片与聚合
+--  - clusteragent 负责将分片请求拼接（append/concat）并调用本地服务；trace 信息通过额外指令透传
 ```
 
 ### 远程调用API
@@ -418,6 +401,12 @@ local result = cluster.call("node2", ".service", "method", ...)
 
 -- 发送消息（无响应）
 cluster.send("node2", ".service", "notify", ...)
+
+-- 代理（本地 handle）
+-- 推荐：显式传 node 与 name
+local h = cluster.proxy("node2", ".service")
+-- 可选：也支持 "node.name" 或 "node@.name" 的组合写法
+local h2 = cluster.proxy("node2.service")
 
 -- 获取代理对象
 local proxy = cluster.proxy("node2", ".service")
@@ -572,7 +561,7 @@ local result = skynet.call(db_proxy, "lua", "query", "sql")
 skynet.send(db_proxy, "lua", "update", "data")
 
 -- 方式3: 注册为本地名字
-local db = cluster.proxy("node2@.database")
+local db = cluster.proxy("node2", ".database")
 skynet.name(".remote_db", db)
 
 -- 通过名字使用
@@ -790,45 +779,43 @@ end
 
 ### 自动重连机制
 
+SocketChannel 默认支持断线自动重连，无需额外回调配置。创建时指定 `host/port/response/nodelay`，`channel:connect(true)` 会触发连接；发生异常会关闭通道并唤醒所有等待者（以 `socket_error`）。上层可在 `clustersender.req` 处捕获错误并按需触发重试。
+
 ```lua
--- Socket Channel的重连配置
 local channel = sc.channel {
-    host = host,
-    port = port,
-    response = read_response,
-    nodelay = true,
-    
-    -- 连接失败处理
-    connect_fail = function()
-        skynet.error("Connect failed, retry...")
-        return true  -- 继续重试
-    end,
-    
-    -- 断线处理
-    disconnect = function()
-        skynet.error("Disconnected, reconnecting...")
-        return true  -- 自动重连
-    end,
+  host = host,
+  port = port,
+  response = read_response,  -- 解析响应 (session, ok, data, padding)
+  nodelay = true,
 }
+
+-- 首次连接/切换节点
+channel:connect(true)
+
+-- 发送请求（自动处理分片与聚合）
+local ok, data = pcall(channel.request, channel, request, session, padding)
 ```
 
-### 请求超时处理
+### 请求超时处理（建议模式）
+
+Skynet 的 `cluster.call` 为阻塞调用，无内建超时参数。可使用并发协程与 `skynet.sleep` 实现超时控制：
 
 ```lua
--- 带超时的远程调用
-local function call_with_timeout(node, service, ...)
-    local ok, result = pcall(function()
-        return skynet.timeout(500, function()  -- 5秒超时
-            return cluster.call(node, service, ...)
-        end)
-    end)
-    
-    if not ok then
-        skynet.error("Call timeout:", node, service)
-        return nil, "timeout"
-    end
-    
-    return result
+local function call_with_timeout(node, service, ms, ...)
+  local co = coroutine.running()
+  local done, ret
+  skynet.fork(function()
+    ret = { pcall(cluster.call, node, service, ...) }
+    if not done then skynet.wakeup(co) end
+  end)
+  skynet.sleep(math.floor(ms/10))  -- 1 tick = 10ms
+  done = true
+  if ret then
+    local ok = table.remove(ret, 1)
+    return ok and table.unpack(ret) or nil, ret[1]
+  else
+    return nil, "timeout"
+  end
 end
 ```
 
@@ -1069,11 +1056,11 @@ Cluster服务提供了Skynet的跨进程分布式解决方案：
 
 | 特性 | Harbor | Cluster |
 |------|--------|---------|
-| 部署方式 | 单进程 | 多进程 |
-| 扩展性 | 有限(255节点) | 无限 |
-| 容错性 | 进程级 | 节点级 |
-| 配置复杂度 | 简单 | 中等 |
-| 适用场景 | 小型系统 | 大型分布式 |
+| 部署方式 | 多进程/跨机器 | 多进程/跨机器 |
+| 扩展性 | 最多255个节点 | 理论不限制（取决于配置） |
+| 容错性 | Master/节点级 | 节点级（sender 重连） |
+| 配置复杂度 | 简单（Harbor env） | 中等（cluster 配置） |
+| 适用场景 | 小中型系统 | 大型分布式 |
 
 ### 使用建议
 
