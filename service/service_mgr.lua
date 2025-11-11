@@ -4,6 +4,10 @@
 --   - 并发请求同名服务会排队（waitfor），仅首个触发真正创建
 --   - 支持 snaxd 与普通服务（snlua）的启动与查询
 --   - 在 standalone 模式下，还提供全局管理（SERVICE）
+--  约定与技巧：
+--   - 名字以 '@' 开头表示全局名（跨 harbor），其余为本地名
+--   - GLAUNCH/GQUERY 在 standalone 模式下由本服务集约，在非 standalone 模式转发到远端 SERVICE
+--   - waitfor 负责“仅一次创建”的并发控制：失败时以文本错误缓存，后续立即抛错
 local skynet = require "skynet"
 require "skynet.manager"	-- import skynet.register
 local snax = require "skynet.snax"
@@ -36,6 +40,9 @@ end
 -- 等待 name 对应的地址：
 --  - 第一次带 func 调用触发启动，其余并发请求等待
 --  - 若之前失败，直接抛错（字符串）
+-- 创建/等待 name 对应的服务地址：
+--  - 带 func 的第一个调用方作为“创建者”；其余并发调用方进入队列等待
+--  - 若历史失败：直接抛出错误文本
 local function waitfor(name , func, ...)
 	local s = service[name]
 	if type(s) == "number" then

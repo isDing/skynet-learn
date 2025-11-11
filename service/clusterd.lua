@@ -3,6 +3,13 @@
 --   - 维护 node->address 映射与 sender 的生命周期
 --   - 提供 sender/proxy/listen/register/queryname 等接口
 --   - 监听 socket 连接，接入 clusteragent 为每个 fd 提供协议处理
+--  流程要点：
+--   - open_channel(name)：按需创建/切换 sender（clustersender 服务）
+--     • address=nil 且 nowaiting=false：等待配置；true：不等待（直接缺席）
+--     • address=false：关闭 sender（节点下线）
+--     • address=host:port：changenode -> connect
+--   - reload(config)：重载 cluster 配置，触发增删改并唤醒等待者
+--   - listen(addr,port)：启动 gate 监听，为每个入站 fd 启动 clusteragent
 local skynet = require "skynet"
 require "skynet.manager"
 local cluster = require "skynet.cluster.core"
@@ -20,6 +27,7 @@ local connecting = {}
 -- 按需建立/切换到 node 的 sender：
 --  - 支持等待 node 地址解析（config.nowaiting 可跳过）
 --  - changenode(host,port|false) 切换/关闭 sender
+-- 为 node(key) 打开或切换到有效 sender：处理等待/关闭/切换等状态
 local function open_channel(t, key)
 	local ct = connecting[key]
 	if ct then
@@ -38,6 +46,7 @@ local function open_channel(t, key)
 	connecting[key] = ct
 	local address = node_address[key]
 	if address == nil and not config.nowaiting then
+        -- 等待节点上线：namequery 唤醒点在 loadconfig 中
 		local co = coroutine.running()
 		assert(ct.namequery == nil)
 		ct.namequery = co
@@ -70,6 +79,7 @@ local function open_channel(t, key)
 			err = string.format("changenode [%s] (%s:%s) failed", key, host, port)
 		end
 	elseif address == false then
+        -- 节点下线：尝试关闭已存在的 sender
 		c = node_sender[key]
 		if c == nil or node_sender_closed[key] then
 			-- no sender or closed, always succ
@@ -99,6 +109,10 @@ end
 local node_channel = setmetatable({}, { __index = open_channel })
 
 -- 载入配置：支持从文件（skynet.getenv "cluster"）或传入表重载
+-- 载入/重载配置：
+--  - __nowaiting 转为 config.nowaiting 控制是否等待节点上线
+--  - address=false 标识节点下线，触发 sender 关闭
+--  - address 变更时，清理 node_channel 缓存并异步 open_channel
 local function loadconfig(tmp)
 	if tmp == nil then
 		tmp = {}

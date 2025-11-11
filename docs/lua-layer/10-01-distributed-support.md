@@ -36,9 +36,9 @@
 
 ### 1.1 设计理念
 
-Skynet提供两层分布式架构：
-- **Harbor**：单进程多节点，共享内存通信
-- **Cluster**：多进程集群，网络通信
+Skynet提供两套分布式通信能力：
+- **Harbor**：早期内置的跨节点机制（基于 socket 直连），用于节点间消息转发与全局命名
+- **Cluster**：更灵活的集群框架（同样基于 socket），提供远程调用/代理/动态配置
 
 **核心设计原则：**
 1. **透明性**：远程调用像本地调用一样简单
@@ -52,13 +52,10 @@ Skynet提供两层分布式架构：
 应用层
   ├── 业务服务
   │
-分布式框架层
-  ├── Cluster (跨进程)
-  ├── Multicast (多播)
-  │
-Harbor层 (进程内)
-  ├── Master/Slave
-  ├── 全局名字服务
+分布式框架层（进程间）
+  ├── Cluster（集群框架：clusterd/clustersender/clusterproxy）
+  ├── Multicast（多播）
+  ├── Harbor（Master/Slave + 全局名字服务）
   │
 网络层
   └── Socket通信
@@ -81,12 +78,12 @@ Harbor层 (进程内)
 
 ### 2.1 Harbor概念
 
-Harbor是Skynet内置的节点间通信机制，支持单进程内多个节点（最多255个）：
+Harbor是Skynet内置的跨节点通信机制（最多255个）：
 
 ```lua
 -- 配置harbor
 harbor = 1  -- 节点ID，1-255
-address = "127.0.0.1:2526"  -- master地址
+address = "127.0.0.1:2526"  -- 本节点监听地址（供其它 slave 连接）
 master = "127.0.0.1:2525"  -- master监听地址
 standalone = false  -- 是否独立模式
 ```
@@ -140,7 +137,7 @@ skynet.send(addr, "lua", "hello")
 
 ### 2.3 节点间通信
 
-Harbor通过master节点中转实现节点间通信：
+Harbor 的 master 仅用于“控制面”：握手与全局名查询；数据面为 Slave↔Slave 直连转发：
 
 ```lua
 -- 跨节点发送消息
@@ -208,7 +205,7 @@ local function open_channel(t, key)
     local address = node_address[key]
     
     if address == nil and not config.nowaiting then
-        -- 等待节点配置
+        -- 等待节点配置（nowaiting=true 时不等待，直接返回缺席错误）
         local co = coroutine.running()
         ct.namequery = co
         skynet.error("Waiting for cluster node [".. key.."]")
@@ -231,6 +228,13 @@ local function open_channel(t, key)
             t[key] = c
             ct.channel = c
             node_sender_closed[key] = nil
+        end
+    elseif address == false then
+        -- 节点显式下线（address=false）：关闭 sender，等待后续 reload 切回
+        local c = node_sender[key]
+        if c and not node_sender_closed[key] then
+            pcall(skynet.call, c, "lua", "changenode", false)
+            node_sender_closed[key] = true
         end
     end
     
@@ -626,8 +630,7 @@ node2 = "127.0.0.1:7002"
 node3 = "127.0.0.1:7003"
 
 -- 特殊配置（以__开头）
-__nowaiting = false  -- 不等待未配置节点
-__cache = true      -- 启用连接缓存
+__nowaiting = false  -- 是否等待未配置节点（false 表示等待，true 表示不等待）
 
 -- 动态节点（设置为false表示节点下线）
 -- node4 = false
@@ -907,14 +910,14 @@ function team_service:create_team(leader_uid, leader_node)
     return team_id
 end
 
-function team_service:join_team(team_id, uid, node)
+function team_service:join_team(team_id, uid, node, addr)
     local team = self:get_team(team_id)
     if not team then
-        -- 可能在其他节点
-        local remote_team = cluster.query(nil, "team_" .. team_id)
-        if remote_team then
-            return cluster.call(remote_team.node, remote_team.addr, 
-                "join_team", team_id, uid, node)
+        -- 可能在其他节点：根据创建时的 leader_node 查询并远程调用
+        local leader_node = guess_leader_node(team_id)  -- 由业务自行记录/推断
+        local remote_addr = cluster.query(leader_node, "team_" .. team_id)
+        if remote_addr then
+            return cluster.call(leader_node, remote_addr, "join_team", team_id, uid, node, addr)
         end
         return false
     end
@@ -923,10 +926,7 @@ function team_service:join_team(team_id, uid, node)
         return false, "Team full"
     end
     
-    team.members[uid] = {
-        node = node,
-        role = "member"
-    }
+    team.members[uid] = { node = node, addr = addr, role = "member" }
     
     -- 通知所有成员
     self:broadcast_team(team, "member_joined", uid)

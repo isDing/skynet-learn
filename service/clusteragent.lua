@@ -3,6 +3,11 @@
 --   - 使用 PTYPE_CLIENT 协议从 gate 转发上来的数据
 --   - 解包 cluster 请求（可能为分片），支持 trace
 --   - 调用本地服务并打包响应回远端 fd
+--  处理要点：
+--   - 大请求分片：通过 padding 将多帧拼成一个完整请求（large_request），最后 concat
+--   - 名字查询：addr==0 表示 QueryName，返回注册表查询结果
+--   - 名字寻址：cluster.isname(addr)==true 时，先从 register_name（带等待队列）解析
+--   - 调用本地：push → rawsend（无需回应）；call → rawcall/tracecall（需回应）
 local skynet = require "skynet"
 local socket = require "skynet.socket"
 local cluster = require "skynet.cluster.core"
@@ -143,7 +148,7 @@ skynet.start(function()
 	-- fd can write, but don't read fd, the data package will forward from gate though client protocol.
 	-- forward may fail, see https://github.com/cloudwu/skynet/issues/1958
 	-- fd 只负责写：数据包读取由 gate 接管并通过 client 协议转发
-	-- 转发可能失败（参阅相关 issue），这里尽量简化职责
+    -- 注意：转发可能失败（参阅 https://github.com/cloudwu/skynet/issues/1958），此处尽量简化职责
 	pcall(skynet.call,gate, "lua", "forward", fd)
 
 	skynet.dispatch("lua", function(_,source, cmd, ...)

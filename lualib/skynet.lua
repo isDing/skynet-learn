@@ -1119,6 +1119,8 @@ function skynet.address(addr)
 	end
 end
 
+-- 返回某个地址（或当前服务）的 harbor id：
+--  - 传入 skynet.self() 可得到本节点的 harbor id
 function skynet.harbor(addr)
 	return c.harbor(addr)
 end

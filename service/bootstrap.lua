@@ -7,6 +7,9 @@ skynet.start(function()
 	local launcher = assert(skynet.launch("snlua","launcher"))
 	skynet.name(".launcher", launcher)
 
+	-- harbor 模式：
+	--  - harbor=0 ：单机模式（cdummy 作为 .cslave），不需要 master/address
+	--  - harbor>0：分布式模式；若 standalone=true，同步启动 cmaster；始终启动 cslave
 	local harbor_id = tonumber(skynet.getenv "harbor" or 0)
 	if harbor_id == 0 then
 		assert(standalone ==  nil)
@@ -41,6 +44,7 @@ skynet.start(function()
 	end
 	skynet.newservice "service_mgr"
 
+	-- 可选：开启 ltls_holder（用于共享 TLS 环境）
 	local enablessl = skynet.getenv "enablessl"
 	if enablessl == "true" then
 		service.new("ltls_holder", function ()
