@@ -1,9 +1,9 @@
 -- 说明：
 --  .service 管理器：提供 LAUNCH/QUERY/GLAUNCH/GQUERY 等接口，集中管理命名服务。
 --  特点：
---   - 并发请求同名服务会排队（waitfor），仅首个触发真正创建
---   - 支持 snaxd 与普通服务（snlua）的启动与查询
---   - 在 standalone 模式下，还提供全局管理（SERVICE）
+--   - 并发请求同名服务会排队（waitfor），仅首个触发真正创建；其余等待被唤醒
+--   - 支持 snaxd 与普通服务（snlua）的启动与查询（snaxd 通过 service_name+"."+subname 区分实例）
+--   - 在 standalone 模式下，还提供全局管理（注册名 "SERVICE"），聚合所有节点列表
 --  约定与技巧：
 --   - 名字以 '@' 开头表示全局名（跨 harbor），其余为本地名
 --   - GLAUNCH/GQUERY 在 standalone 模式下由本服务集约，在非 standalone 模式转发到远端 SERVICE
@@ -17,6 +17,7 @@ local service = {}
 
 -- 实际启动动作：调用 func，记录成功的地址或失败原因，并唤醒等待队列
 local function request(name, func, ...)
+	-- 启动真实动作：调用 func 并把成功结果保存为 number（handle），失败保存错误字符串
 	local ok, handle = pcall(func, ...)
 	local s = service[name]
 	assert(type(s) == "table")
@@ -59,7 +60,7 @@ local function waitfor(name , func, ...)
 
 	assert(type(s) == "table")
 
-	local session, source = skynet.context()
+	local session, source = skynet.context() -- 记录来源，便于在 LIST 时展示详细初始化/排队信息
 
 	if s.launch == nil and func then
 		s.launch = {

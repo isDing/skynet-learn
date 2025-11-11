@@ -1382,6 +1382,11 @@ end
 
 Logger是一个C实现的日志服务，负责接收和记录所有服务的日志消息。
 
+创建与命名
+- 由C层在Skynet启动早期创建并注册，名称固定为`logger`（见`skynet-src/skynet_start.c`）。
+- 配置项`logger`为可选日志文件路径；未配置时输出到标准输出（stdout）。
+- 通过`skynet.error(...)`产生日志，底层将以`PTYPE_TEXT`消息投递到`logger`服务。
+
 ### C源码分析
 
 **文件位置**: `service-src/service_logger.c`

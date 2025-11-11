@@ -1,8 +1,10 @@
 -- 说明：
---  launcher 是系统级服务，负责：
+--  launcher 是系统级服务（由 bootstrap 首个启动并命名为 .launcher），负责：
 --   - 启动其他服务（LAUNCH/LOGLAUNCH）并追踪其初始化结果（LAUNCHOK/ERROR）
 --   - 列表/统计/内存/GC/杀死服务等管理命令
---   - 维护最近启动的实例的 pending 响应（instance/launch_session）
+--   - 维护最近启动的实例的 pending 响应（instance/launch_session），实现“异步启动，成功/失败回报唤醒调用者”
+--  兼容性：
+--   - 历史原因支持 text 协议（PTYPE_TEXT）：C 服务通过发送 ""/"ERROR" 到 .launcher 完成 LAUNCHOK/ERROR 回报
 local skynet = require "skynet"
 local core = require "skynet.core"
 require "skynet.manager"	-- import manager apis

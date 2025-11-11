@@ -371,6 +371,9 @@ traceback (lua_State *L) {
 
 static void
 report_launcher_error(struct skynet_context *ctx) {
+    // 向 .launcher 上报初始化失败：
+    //  - 历史兼容：通过 PTYPE_TEXT 文本协议发送 "ERROR" 字符串
+    //  - launcher 的 text 协议分发会将其映射为 command.ERROR
 	// sizeof "ERROR" == 5
 	skynet_sendname(ctx, 0, ".launcher", PTYPE_TEXT, 0, "ERROR", 5);
 }

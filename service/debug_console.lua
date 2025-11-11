@@ -1,8 +1,13 @@
 -- 说明：
 --  debug_console 提供 TCP/HTTP 的命令行调试控制台：
 --   - 支持 list/stat/mem/gc/start/snax/clearcache/service/task/uniqtask/inject/logon/logoff/log/…
---   - 支持 http GET/POST 方式提交命令
---   - 通过 `skynet.debug` 协议与目标服务交互（见 COMMAND/COMMANDX）
+--   - 支持 HTTP GET/POST 方式提交命令（便于 curl 集成）
+--   - 对外输出统一的“命令-结果-尾标记”风格；内部通过 `skynet.debug` 协议与目标服务交互（见 COMMAND/COMMANDX）
+--  结构：
+--   - console_main_loop：读取一行命令或 HTTP 请求，解析后调用 docmd
+--   - docmd：按 COMMAND/COMMANDX 路由执行命令，捕获异常并输出 <CMD OK>/<CMD Error>
+--   - COMMAND：简单命令（参数基本类型）
+--   - COMMANDX：复杂命令（需要读取 fd 或对参数做 AST 解析）
 local skynet = require "skynet"
 local codecache = require "skynet.codecache"
 local core = require "skynet.core"
@@ -62,6 +67,10 @@ local function split_cmdline(cmdline)
 end
 
 local function docmd(cmdline, print, fd)
+	-- 执行一行控制台命令：
+	--  1) 优先在 COMMAND 中查找；
+	--  2) 若未命中，尝试 COMMANDX（允许带原始 fd 与整行文本，适配复杂语义如 call/debug）；
+	--  3) 捕获命令异常并打印错误，保持控制台一致的尾部标记。
 	local split = split_cmdline(cmdline)
 	local command = split[1]
 	local cmd = COMMAND[command]
@@ -96,6 +105,10 @@ end
 
 -- 主循环：支持文本命令与 HTTP GET/POST
 local function console_main_loop(stdin, print, addr)
+	-- 注意：
+	--  - GET/POST 路径解析后会将斜杠替换为空格，从而复用 docmd 流程
+	--  - 此处与 COMMANDX.debug 中通过 socket.readline 读取存在“并发读取同一 fd”的潜在风险，
+	--    debug 命令内部已通过探活/唤醒机制规避，但仍建议避免在同一连接上并发两个读循环
 	print("Welcome to skynet console")
 	skynet.error(addr, "connected")
 	local ok, err = pcall(function()
@@ -228,6 +241,7 @@ function COMMAND.service()
 end
 
 local function adjust_address(address)
+	-- 将形如 ".name" / "addr" / ":addr" 的多种格式规整为内部 32 位 handle（本地带 harbor 前缀）
 	local prefix = address:sub(1,1)
 	if prefix == '.' then
 		return assert(skynet.localname(address), "Not a valid name")
@@ -242,6 +256,7 @@ function COMMAND.list()
 end
 
 local function timeout(ti)
+	-- 将“秒”级字符串/数字转换为内部超时（厘秒），nil/<=0 表示不设置专用超时
 	if ti then
 		ti = tonumber(ti)
 		if ti <= 0 then
@@ -412,6 +427,9 @@ function COMMAND.trace(address, proto, flag)
 end
 
 function COMMANDX.call(cmd)
+	-- 语法：call <address> <lua-expr>
+	--  - 通过 load("return "..expr) 将参数表达式解析为 table.pack(...)
+	--  - 将返回值打包并逐项打印（dump_list）
 	local address = adjust_address(cmd[2])
 	local cmdline = assert(cmd[1]:match("%S+%s+%S+%s(.+)") , "need arguments")
 	local args_func = assert(load("return " .. cmdline, "debug console", "t", {}), "Invalid arguments")
@@ -463,6 +481,7 @@ local function convert_stat(info)
 end
 
 function COMMAND.netstat()
+	-- 获取网络连接统计并将时间/字节数做简单格式化，便于人读
 	local stat = socket.netstat()
 	for _, info in ipairs(stat) do
 		convert_stat(info)

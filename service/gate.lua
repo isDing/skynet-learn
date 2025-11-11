@@ -3,12 +3,16 @@
 --   - 监听端口并接入客户端
 --   - 默认将收到的数据以字符串形态发送给 watchdog（lua 消息）
 --   - 通过 CMD.forward 将 fd 绑定到某个 agent，之后数据走 client 协议重定向到 agent
--- 流程：
---  1) Watchdog 启动 gate 并设置 conf.watchdog
---  2) 新连接触发 handler.connect → 记录 connection[fd] 并通知 watchdog.socket.open
---  3) 未 forward 前，数据经 handler.message → watchdog.socket.data（字符串），并释放 msg
---  4) 当 watchdog 分配 agent 后，调用 CMD.forward 绑定 {client, agent}
---  5) 此后数据由 handler.message → skynet.redirect(agent, client, "client", fd, msg, sz) 零拷贝转发
+--  流程：
+--   1) Watchdog 启动 gate 并设置 conf.watchdog
+--   2) 新连接触发 handler.connect → 记录 connection[fd] 并通知 watchdog.socket.open
+--   3) 未 forward 前，数据经 handler.message → watchdog.socket.data（字符串），并释放 msg
+--   4) 当 watchdog 分配 agent 后，调用 CMD.forward 绑定 {client, agent}
+--   5) 此后数据由 handler.message → skynet.redirect(agent, client, "client", fd, msg, sz) 零拷贝转发
+--  关键点：
+--   - 当未 forward 时，采用 skynet.tostring 拷贝数据并回收 C 层缓冲；一旦 forward，走 client 协议零拷贝转发给 agent
+--   - connection[fd].client 用于作为 redirect 的 source，便于 agent 按 PTYPE_CLIENT 分路
+--   - CMD.accept 可以将 forward 状态退回（解绑 agent），恢复为字符串上报 watchdog 的模式
 local skynet = require "skynet"
 local gateserver = require "snax.gateserver"
 

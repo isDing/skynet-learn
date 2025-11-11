@@ -185,6 +185,7 @@ thread_worker(void *p) {
 	return NULL;
 }
 
+// 启动整个运行时：创建 3 个系统线程（监控/定时器/网络）与 N 个 worker 线程，并进入事件循环
 static void
 start(int thread) {
 	pthread_t pid[thread+3];  // 工作线程 + 3个系统线程
@@ -216,7 +217,8 @@ start(int thread) {
 	create_thread(&pid[1], thread_timer, m);
 	create_thread(&pid[2], thread_socket, m);
 
-	static int weight[] = {   // 前4个线程：每次处理1条消息
+	static int weight[] = {   // 线程权重映射：
+		// 前 4 个线程：每次处理 1 条消息
 		-1, -1, -1, -1, 0, 0, 0, 0,  // 5-8线程：每次处理直到队列空
 		1, 1, 1, 1, 1, 1, 1, 1,   // 9-16线程：处理1/2消息
 		2, 2, 2, 2, 2, 2, 2, 2,   // 17-24线程：处理1/4消息
@@ -243,6 +245,7 @@ start(int thread) {
 	free_monitor(m);
 }
 
+// 启动 bootstrap 服务（通常是 "snlua bootstrap"），并把失败日志刷入 logger
 static void
 bootstrap(struct skynet_context * logger, const char * cmdline) {
 	int sz = strlen(cmdline);
@@ -293,7 +296,7 @@ skynet_start(struct skynet_config * config) {
 	skynet_socket_init();    					// 网络子系统
 	skynet_profile_enable(config->profile); 	// 性能分析（可选）
 
-    // 4. 创建日志服务
+    // 4. 创建日志服务（名称固定为 "logger"，供 skynet_error 查找）
 	struct skynet_context *ctx = skynet_context_new(config->logservice, config->logger);
 	if (ctx == NULL) {
 		// 日志服务启动失败
@@ -303,7 +306,7 @@ skynet_start(struct skynet_config * config) {
 
 	skynet_handle_namehandle(skynet_context_handle(ctx), "logger");
 
-    // 5. 启动 bootstrap 服务
+    // 5. 启动 bootstrap 服务（Lua 层会创建 .launcher/.service 等系统服务）
 	bootstrap(ctx, config->bootstrap);
 
     // 6. 创建并启动所有线程
