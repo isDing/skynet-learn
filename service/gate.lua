@@ -3,6 +3,12 @@
 --   - 监听端口并接入客户端
 --   - 默认将收到的数据以字符串形态发送给 watchdog（lua 消息）
 --   - 通过 CMD.forward 将 fd 绑定到某个 agent，之后数据走 client 协议重定向到 agent
+-- 流程：
+--  1) Watchdog 启动 gate 并设置 conf.watchdog
+--  2) 新连接触发 handler.connect → 记录 connection[fd] 并通知 watchdog.socket.open
+--  3) 未 forward 前，数据经 handler.message → watchdog.socket.data（字符串），并释放 msg
+--  4) 当 watchdog 分配 agent 后，调用 CMD.forward 绑定 {client, agent}
+--  5) 此后数据由 handler.message → skynet.redirect(agent, client, "client", fd, msg, sz) 零拷贝转发
 local skynet = require "skynet"
 local gateserver = require "snax.gateserver"
 

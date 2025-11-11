@@ -1,3 +1,13 @@
+-- 说明：
+--  http.internal 是 httpc/httpd 的核心协议工具集：
+--   - recvheader/parseheader：读取并解析 HTTP 头
+--   - recvchunkedbody：按 chunked 编码读取响应体
+--   - request/response：发送请求与读取响应（一次性）
+--   - response_stream：以迭代器形式暴露响应体，支持 chunked 与 content-length
+--  设计说明：
+--   - 限制 header 最大长度（LIMIT）避免 DoS；chunksize/readcrln 对异常严格校验
+--   - 流读取中以状态机切换 _reading（nobody/length/all/chunked），并暴露 connected 状态
+--   - TODO：流式读取未实现超时，调用方需在上层控制生命周期（见 httpc.request_stream）
 local table = table
 local type = type
 local string = string
@@ -11,6 +21,7 @@ local M = {}
 
 local LIMIT = 8192
 
+-- 读取 chunked 的 size 行，直到 CRLF；防止无界增长（#body > 128 即拒绝）
 local function chunksize(readbytes, body)
 	while true do
 		local f,e = body:find("\r\n",1,true)
@@ -25,6 +36,7 @@ local function chunksize(readbytes, body)
 	end
 end
 
+-- 读取并校验 CRLF，返回剩余 body；若异常返回 nil
 local function readcrln(readbytes, body)
 	if #body >= 2 then
 		if body:sub(1,2) ~= "\r\n" then
@@ -40,6 +52,10 @@ local function readcrln(readbytes, body)
 	end
 end
 
+-- 读取 HTTP 首部：
+--  - 累积直到出现 \r\n\r\n
+--  - 限制最大长度 LIMIT，避免过长首部
+--  - 将逐行结果写入 lines，并返回剩余 body（可能含部分实体）
 function M.recvheader(readbytes, lines, header)
 	if #header >= 2 then
 		if header:find "^\r\n" then
@@ -76,6 +92,7 @@ function M.recvheader(readbytes, lines, header)
 	return result
 end
 
+-- 解析首部行：处理同名多值（合并为表），tab 前缀行视为上一行延续
 function M.parseheader(lines, from, header)
 	local name, value
 	for i=from,#lines do
@@ -106,6 +123,9 @@ function M.parseheader(lines, from, header)
 	return header
 end
 
+-- 读取 chunked 实体：
+--  - 循环读取 size → 正文 → CRLF；size=0 后继续读取 trailer（作为 header 补充）
+--  - bodylimit：可选的最大实体限制
 function M.recvchunkedbody(readbytes, bodylimit, header, body)
 	local result = ""
 	local size = 0
@@ -147,6 +167,7 @@ function M.recvchunkedbody(readbytes, bodylimit, header, body)
 	return result, header
 end
 
+-- identity 模式读取实体：优先 Content-Length；204/304/1xx 视为空体；否则 readall
 local function recvbody(interface, code, header, body)
 	local length = header["content-length"]
 	if length then
@@ -169,6 +190,9 @@ local function recvbody(interface, code, header, body)
 	return body
 end
 
+-- 发送一次请求并读取响应首部：
+--  - 若有 content 且未启用 chunked，自动写入 Content-length
+--  - 返回 code, body(可能含剩余实体), header
 function M.request(interface, method, host, url, recvheader, header, content)
 	local read = interface.read
 	local write = interface.write
@@ -215,6 +239,7 @@ function M.request(interface, method, host, url, recvheader, header, content)
 	return code, body, header
 end
 
+-- 读取完整响应体：根据 transfer-encoding 决定 chunked 或 identity
 function M.response(interface, code, body, header)
 	local mode = header["transfer-encoding"]
 	if mode then
@@ -236,6 +261,9 @@ function M.response(interface, code, body, header)
 	return body
 end
 
+-- 流式响应体：
+--  - stream.__call → stream:padding()，可被 Lua 泛型 for 使用
+--  - stream.connected 指示连接是否仍可读；close 触发 _onclose（通常关闭 fd）
 local stream = {}; stream.__index = stream
 
 function stream:close()
@@ -245,6 +273,7 @@ function stream:close()
 	end
 end
 
+-- 以 (iterator, state) 形式返回，下游可 for chunk in stream do ... end
 function stream:padding()
 	return self._reading(self), self
 end
@@ -252,12 +281,14 @@ end
 stream.__close = stream.close
 stream.__call = stream.padding
 
+-- 无实体（204/304/1xx）：关闭迭代，返回空串一次
 local function stream_nobody(stream)
 	stream._reading = stream.close
 	stream.connected = nil
 	return ""
 end
 
+-- 固定长度实体：按 content-length 读取
 local function stream_length(length)
 	return function(stream)
 		local body = stream._body
@@ -287,6 +318,7 @@ local function stream_length(length)
 	end
 end
 
+-- 逐次读取：当返回空或连接断开，设置 connected=nil 并触发 close
 local function stream_read(stream)
 	local ret, padding = stream._interface.read()
 	if ret == "" or not ret then
@@ -300,6 +332,7 @@ local function stream_read(stream)
 	return ret
 end
 
+-- 读取剩余全部实体后，切换为按需读取模式（对后续 chunked 处理兼容）
 local function stream_all(stream)
 	local body = stream._body
 	stream._body = nil
@@ -307,6 +340,7 @@ local function stream_all(stream)
 	return body
 end
 
+-- chunked 模式：逐块返回 body，结尾读取 trailer 并合并到 header
 local function stream_chunked(stream)
 	local read = stream._interface.read
 	local sz, body = chunksize(read, stream._body)
@@ -353,6 +387,7 @@ local function stream_chunked(stream)
 	return body
 end
 
+-- 以流式方式封装响应体：根据编码选择读取函数，并携带状态
 function M.response_stream(interface, code, body, header)
 	local mode = header["transfer-encoding"]
 	if mode then

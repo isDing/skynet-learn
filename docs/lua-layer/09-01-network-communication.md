@@ -847,9 +847,11 @@ local function udp_client()
     local id = socket.udp(function(str, from)
         print("Reply:", str)
     end)
-    
+    -- 连接默认发送地址（可省略回调）
     socket.udp_connect(id, "127.0.0.1", 8888)
-    socket.write(id, "Hello UDP")
+    -- 发送数据（UDP 使用 sendto，而非 socket.write）
+    local addr = socket.udp_address("127.0.0.1", 8888)
+    socket.sendto(id, addr, "Hello UDP")
 end
 ```
 
@@ -1045,6 +1047,58 @@ skynet.register_protocol {
     unpack = custom_unpack,
 }
 ```
+
+## 8. SocketChannel 通道概览
+
+socketchannel 是对 TCP 长连接的高层封装，适合“请求→响应”的协议（如 Redis/MySQL/Mongo 等）。
+
+- 两种模式：
+  - 顺序模式（默认）：发送请求的顺序与响应一一对应，按 FIFO 唤醒等待协程
+  - 会话模式：desc.response 从流中解析出 session，按 session 精确唤醒对应协程
+- 核心特性：
+  - 自动重连与主备地址切换
+  - 可注入认证逻辑（desc.auth）
+  - 过载通知（发送缓冲积压时触发 overload 回调）
+
+最小顺序模式示例：
+
+```lua
+local sc = require "skynet.socketchannel"
+
+-- 假设远端协议：一行一条响应
+local ch = sc.channel {
+  host = "127.0.0.1", port = 9000,
+  -- 顺序模式：response 是一个解析函数，返回 ok, data[, padding]
+  response = nil,  -- 顺序模式可不填；会话模式才需要提供 response(self.__sock)
+}
+
+-- 连接（一次尝试，不重试）
+ch:connect(true)
+
+-- 定义一个按行读取的解析函数（顺序模式）
+local function read_line(sock)
+  local s = sock:readline("\n")
+  return true, s
+end
+
+-- 发送请求并等待响应
+local req = "PING\n"
+local ok, res = pcall(function()
+  return ch:request(req, read_line)
+end)
+
+if ok then
+  print("resp:", res)
+else
+  print("request failed:", res)
+end
+
+ch:close()
+```
+
+说明：
+- 会话模式下，将 desc.response 设为一个函数，每次从流中解析出 session 与数据，socketchannel 内部按 session 唤醒对应协程。
+- 细节注释可参考 `lualib/skynet/socketchannel.lua` 源码顶部与内部流程注释。
 
 ## 总结
 

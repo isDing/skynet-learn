@@ -65,16 +65,20 @@ local function launch_slave(auth_handler)
 		local challenge = crypt.randomkey()
 		write("auth", fd, crypt.base64encode(challenge).."\n")
 
+		-- 1) 客户端握手 key
 		local handshake = assert_socket("auth", socket.readline(fd), fd)
 		local clientkey = crypt.base64decode(handshake)
 		if #clientkey ~= 8 then
 			error "Invalid client key"
 		end
+		-- 2) 生成服务端 key，回发 DH 交换值
 		local serverkey = crypt.randomkey()
 		write("auth", fd, crypt.base64encode(crypt.dhexchange(serverkey)).."\n")
 
+		-- 3) 计算共享密钥 secret
 		local secret = crypt.dhsecret(clientkey, serverkey)
 
+		-- 4) 校验 challenge 的 HMAC 响应
 		local response = assert_socket("auth", socket.readline(fd), fd)
 		local hmac = crypt.hmac64(challenge, secret)
 
@@ -82,6 +86,7 @@ local function launch_slave(auth_handler)
 			error "challenge failed"
 		end
 
+		-- 5) 解密 token（DES(secret, base64(token))）
 		local etoken = assert_socket("auth", socket.readline(fd),fd)
 
 		local token = crypt.desdecode(secret, crypt.base64decode(etoken))
@@ -107,6 +112,7 @@ local function launch_slave(auth_handler)
 	local function auth_fd(fd, addr)
 		skynet.error(string.format("connect from %s (fd = %d)", addr, fd))
 		socket.start(fd)	-- may raise error here
+		-- 认证过程中可能抛 socket_error：用 ret_pack 封装后回给 master
 		local msg, len = ret_pack(pcall(auth, fd, addr))
 		socket.abandon(fd)	-- never raise error here
 		return msg, len
@@ -134,6 +140,7 @@ local function accept(conf, s, fd, addr)
 	local ok, server, uid, secret = skynet.call(s, "lua",  fd, addr)
 	-- slave will accept(start) fd, so we can write to fd later
 
+	-- 认证失败：按照约定写回 401；ok==nil 表示 rpc 异常（不回 401）
 	if not ok then
 		if ok ~= nil then
 			write("response 401", fd, "401 Unauthorized\n")
@@ -150,6 +157,7 @@ local function accept(conf, s, fd, addr)
 		user_login[uid] = true
 	end
 
+	-- 执行业务登录：返回 subid（可作为后续握手参数），失败返回 403
 	local ok, err = pcall(conf.login_handler, server, uid, secret)
 	-- unlock login
 	user_login[uid] = nil
@@ -176,12 +184,14 @@ local function launch_master(conf)
 		skynet.ret(skynet.pack(conf.command_handler(command, ...)))
 	end)
 
+	-- 预创建 slave 实例，采用简单轮询做负载均衡
 	for i=1,instance do
 		table.insert(slave, skynet.newservice(SERVICE_NAME))
 	end
 
 	skynet.error(string.format("login server listen at : %s %d", host, port))
 	local id = socket.listen(host, port)
+	-- 主动接入回调：从 slave 池轮询挑一个进行鉴权
 	socket.start(id , function(fd, addr)
 		local s = slave[balance]
 		balance = balance + 1

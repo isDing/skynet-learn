@@ -189,7 +189,10 @@ function server.start(conf)
 
 	-- atomic , no yield
 	local function do_auth(fd, message, addr)
-		-- 认证流程（不可 yield）：校验 index 递增与 HMAC，成功后绑定 fd/ip
+		-- 认证流程（不可 yield）
+	--  - 客户端首包：username:index:hmac 其中 username=base64(uid)@base64(server)#base64(subid)
+	--  - 服务端校验：index 必须严格递增（防止重放），HMAC(challenge, secret) 必须匹配
+	--  - 通过后：更新 u.version=idx，记录当前 fd/ip，connection[fd]=u
 		local username, index, hmac = string.match(message, "([^:]*):([^:]*):([^:]*)")
 		local u = user_online[username]
 		if u == nil then
@@ -240,8 +243,17 @@ function server.start(conf)
 	-- 上层业务请求处理函数：形如 function(username, message) return response_string end
 
 	-- u.response is a struct { return_fd , response, version, index }
+	-- u.response[session] 的条目结构：
+	--   p[1] = return_fd（发送响应时用的 fd，支持在多次请求中切换）
+	--   p[2] = response（二进制串，打包好的返回数据，含 ok 标志与 session）
+	--   p[3] = version（构建响应时的 u.version，用于检测重放/复用）
+	--   p[4] = index（构建响应时的 u.index，用于过期淘汰窗口）
+	-- 备注：u.index 用于控制缓存窗口大小（expired_number），允许响应在断线重连后被重投递。
 	local function retire_response(u)
-		-- 清理过期响应：通过 index 窗口移动删除过旧的已完成响应，控制缓存量
+		-- 清理过期响应：
+		--  - 以 u.index 为“构建时刻”的单调计数，对每个响应记录 p[4] 保存构建时的 index
+		--  - 当 index 前进到 2*expired_number 时，滑动窗口：把完成的响应中“过旧”的项移除
+		--  - 对仍较新的项将 p[4] 回退 expired_number，随后将 u.index 归一为当前窗口最大值+1
 		if u.index >= expired_number * 2 then
 			local max = 0
 			local response = u.response
@@ -263,13 +275,22 @@ function server.start(conf)
 	end
 
 	local function do_request(fd, message)
-		-- 处理业务请求：按会话处理重发/复用，执行上层 handler 并缓存响应用于重投递
+		-- 处理业务请求：
+		--  1) 解析 session，检查是否已有记录 p = u.response[session]
+		--  2) 若 p 存在且 p[3]==u.version，表示同一连接内的复用/重放：
+		--     - 若 p[2] 未生成（上一次还在处理），则判为冲突；否则重投递 p[2]
+		--  3) 若 p 不存在：创建 p={ return_fd=fd }，调用上层 request_handler 生成结果（二进制响应 + ok/session）
+		--     将结果打包为 p[2]，并记录构建时的 version/index
+		--  4) 每次请求后 u.index 自增、根据 p[1] 的最新 fd 发送，最后 retire_response 控制窗口大小
 		local u = assert(connection[fd], "invalid fd")
 		local session = string.unpack(">I4", message, -4)
 		message = message:sub(1,-5)
 		local p = u.response[session]
 		if p then
 			-- session can be reuse in the same connection
+			-- 同一连接内允许复用 session：
+			--   若记录的 version 等于当前 u.version，说明这是一次重放/复用；
+			--   若上一条记录还未生成响应（p[2] == nil），判定冲突（错误）。
 			if p[3] == u.version then
 				local last = u.response[session]
 				u.response[session] = nil
@@ -287,6 +308,7 @@ function server.start(conf)
 			u.response[session] = p
 			local ok, result = pcall(request_handler, u.username, message)
 			-- NOTICE: YIELD here, socket may close.
+			-- 注意：此处可能 yield，期间 fd 可能断开，因此后续发送需基于 p[1] 再检查 connection[fd]
 			result = result or ""
 			if not ok then
 				skynet.error(result)
@@ -301,6 +323,7 @@ function server.start(conf)
 		else
 			-- update version/index, change return fd.
 			-- resend response.
+			-- 更新返回 fd 与 version/index，用于重投递缓存响应（断线重连场景）
 			p[1] = fd
 			p[3] = u.version
 			p[4] = u.index

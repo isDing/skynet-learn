@@ -129,33 +129,30 @@ end
 ```lua
 function httpc.request_stream(method, hostname, url, recvheader, header, content)
     local fd, interface, host = connect(hostname, httpc.timeout)
-    local ok, statuscode, body, header = pcall(internal.request, 
+    local ok, statuscode, body, header = pcall(internal.request,
         interface, method, host, url, recvheader, header, content)
-    
+
     interface.finish = true  -- 不在超时时关闭
-    
+
     local function close_fd()
         close_interface(interface, fd)
     end
-    
+
     if not ok then
         close_fd()
         error(statuscode)
     end
-    
+
+    -- 注意：response_stream 暂无内置超时；调用方需负责在适当时机 stream:close()
     local stream = internal.response_stream(interface, statuscode, body, header)
     stream._onclose = close_fd
     return stream
 end
 
--- 使用流式响应
+-- 使用流式响应（推荐迭代器用法）
 local stream = httpc.request_stream("GET", "www.example.com", "/api/stream")
-while true do
-    local chunk = stream:read()
-    if not chunk then
-        break
-    end
-    -- 处理数据块
+for chunk in stream do
+    if not chunk then break end
     process_chunk(chunk)
 end
 stream:close()
@@ -170,54 +167,53 @@ stream:close()
 local httpd = {}
 
 function httpd.read_request(readbytes, bodylimit)
-    local tmpline = {}
-    local body = internal.recvheader(readbytes, tmpline, "")
-    if not body then
-        return 413  -- Request Entity Too Large
-    end
-    
-    local request = assert(tmpline[1])
-    local method, url, httpver = request:match "^(%a+)%s+(.-)%s+HTTP/([%d%.]+)$"
-    assert(method and url and httpver)
-    
-    httpver = assert(tonumber(httpver))
-    if httpver < 1.0 or httpver > 1.1 then
-        return 505  -- HTTP Version not supported
-    end
-    
-    local header = internal.parseheader(tmpline, 2, {})
-    if not header then
-        return 400  -- Bad request
-    end
-    
-    -- 处理body
-    local length = header["content-length"]
-    if length then
-        length = tonumber(length)
-    end
-    
-    local mode = header["transfer-encoding"]
-    if mode == "chunked" then
-        body, header = internal.recvchunkedbody(readbytes, bodylimit, header, body)
+    -- 返回值次序为 (code, url, method, header, body)
+    local ok, code, url, method, header, body = pcall(function()
+        local tmpline = {}
+        local body = internal.recvheader(readbytes, tmpline, "")
         if not body then
             return 413
         end
-    else
-        -- identity mode
-        if length then
-            if bodylimit and length > bodylimit then
-                return 413
-            end
-            if #body >= length then
-                body = body:sub(1, length)
-            else
-                local padding = readbytes(length - #body)
-                body = body .. padding
+        local request = assert(tmpline[1])
+        local method, url, httpver = request:match "^(%a+)%s+(.-)%s+HTTP/([%d%.]+)$"
+        assert(method and url and httpver)
+        httpver = assert(tonumber(httpver))
+        if httpver < 1.0 or httpver > 1.1 then
+            return 505
+        end
+        local header = internal.parseheader(tmpline, 2, {})
+        if not header then
+            return 400
+        end
+        local length = header["content-length"]
+        if length then length = tonumber(length) end
+        local mode = header["transfer-encoding"]
+        if mode then
+            if mode ~= "identity" and mode ~= "chunked" then
+                return 501
             end
         end
+        if mode == "chunked" then
+            body, header = internal.recvchunkedbody(readbytes, bodylimit, header, body)
+            if not body then return 413 end
+        else
+            if length then
+                if bodylimit and length > bodylimit then return 413 end
+                if #body >= length then
+                    body = body:sub(1, length)
+                else
+                    local padding = readbytes(length - #body)
+                    body = body .. padding
+                end
+            end
+        end
+        return 200, url, method, header, body
+    end)
+    if ok then
+        return code, url, method, header, body
+    else
+        return nil, code
     end
-    
-    return 200, method, url, httpver, header, body
 end
 ```
 
@@ -225,39 +221,44 @@ end
 
 ```lua
 function httpd.write_response(writefunc, statuscode, body, header)
-    local statusline = string.format("HTTP/1.1 %03d %s\r\n", 
-        statuscode, http_status_msg[statuscode] or "")
-    
-    writefunc(statusline)
-    
-    if header then
-        for k, v in pairs(header) do
-            writefunc(string.format("%s: %s\r\n", k, v))
-        end
-    end
-    
-    local t = type(body)
-    if t == "string" then
-        writefunc(string.format("content-length: %d\r\n\r\n", #body))
-        writefunc(body)
-    elseif t == "function" then
-        writefunc("transfer-encoding: chunked\r\n\r\n")
-        while true do
-            local chunk = body()
-            if chunk then
-                if chunk ~= "" then
-                    writefunc(string.format("%x\r\n", #chunk))
-                    writefunc(chunk)
-                    writefunc("\r\n")
+    -- 返回 ok, err（pcall 包装）
+    return pcall(function()
+        local statusline = string.format("HTTP/1.1 %03d %s\r\n",
+            statuscode, http_status_msg[statuscode] or "")
+        writefunc(statusline)
+        if header then
+            for k, v in pairs(header) do
+                if type(v) == "table" then
+                    for _, vv in ipairs(v) do
+                        writefunc(string.format("%s: %s\r\n", k, vv))
+                    end
+                else
+                    writefunc(string.format("%s: %s\r\n", k, v))
                 end
-            else
-                writefunc("0\r\n\r\n")
-                break
             end
         end
-    else
-        writefunc("\r\n")
-    end
+        local t = type(body)
+        if t == "string" then
+            writefunc(string.format("content-length: %d\r\n\r\n", #body))
+            writefunc(body)
+        elseif t == "function" then
+            writefunc("transfer-encoding: chunked\r\n")
+            while true do
+                local chunk = body()
+                if chunk then
+                    if chunk ~= "" then
+                        writefunc(string.format("\r\n%x\r\n", #chunk))
+                        writefunc(chunk)
+                    end
+                else
+                    writefunc("\r\n0\r\n\r\n")
+                    break
+                end
+            end
+        else
+            writefunc("\r\n")
+        end
+    end)
 end
 ```
 
@@ -498,47 +499,35 @@ end
 ### 3.3 消息缓存
 
 ```lua
+-- 伪代码：与实现一致的结构与流程
 local function do_request(fd, message)
     local u = assert(connection[fd], "invalid fd")
     local session = string.unpack(">I4", message, -4)
     message = message:sub(1, -5)
-    
+
     local p = u.response[session]
-    if p then
-        -- 会话已存在，是重发
-        local last = u.response[session]
-        local dummy_msg = string.pack(">BI4", last.ok, session)
-        return socketdriver.send(fd, last.msg .. dummy_msg)
+    if p and p[3] == u.version then
+        -- 同一版本下复用：若已生成响应，直接重投递；否则为冲突
+        if not p[2] then error("Conflict session") end
+        return socketdriver.send(fd, p[2])
     end
-    
-    local ok, result = pcall(conf.request_handler, u.username, session, message)
-    
-    -- 缓存响应
-    local response
-    if ok then
-        response = result
-        ok = 1
-    else
-        response = "\0" .. result
-        ok = 0
+
+    if not p then p = { fd }; u.response[session] = p end
+
+    local ok, result = pcall(conf.request_handler, u.username, message)
+    result = (ok and (result or "") or "") .. string.pack(">BI4", ok and 1 or 0, session)
+
+    p[2] = string.pack(">s2", result)
+    p[3] = u.version
+    p[4] = u.index
+    u.index = u.index + 1
+
+    local rfd = p[1]
+    if connection[rfd] then
+        socketdriver.send(rfd, p[2])
     end
-    
-    -- 更新缓存
-    local index = u.index + 1
-    u.index = index
-    u.response[index] = {
-        msg = response,
-        ok = ok,
-    }
-    
-    -- 清理过期缓存
-    local expired = index - expired_number
-    if expired > 0 then
-        u.response[expired] = nil
-    end
-    
-    -- 发送响应
-    return socketdriver.send(fd, response .. string.pack(">BI4", ok, session))
+    p[1] = nil
+    retire_response(u)
 end
 ```
 
@@ -547,24 +536,20 @@ end
 ### 4.1 协议升级
 
 ```lua
--- WebSocket握手
+-- WebSocket 服务端握手（简化示例）：建议同时校验 Upgrade/Connection/Version
 local function accept_handshake(fd, header)
     local key = header["sec-websocket-key"]
-    if not key then
-        return false
-    end
-    
-    -- 计算accept key
-    local accept = crypt.base64encode(crypt.sha1(key .. 
-        "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
-    
-    -- 发送握手响应
-    local response = "HTTP/1.1 101 Switching Protocols\r\n" ..
-        "Upgrade: websocket\r\n" ..
-        "Connection: Upgrade\r\n" ..
-        "Sec-WebSocket-Accept: " .. accept .. "\r\n" ..
-        "\r\n"
-    
+    if not key then return false end
+    if not header["upgrade"] or header["upgrade"]:lower() ~= "websocket" then return false end
+    if not header["connection"] or not header["connection"]:lower():find("upgrade", 1, true) then return false end
+    if header["sec-websocket-version"] ~= "13" then return false end
+
+    local accept = crypt.base64encode(crypt.sha1(key .. "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+    local response = "HTTP/1.1 101 Switching Protocols\r\n"
+        .. "Upgrade: websocket\r\n"
+        .. "Connection: Upgrade\r\n"
+        .. string.format("Sec-WebSocket-Accept: %s\r\n", accept)
+        .. "\r\n"
     socket.write(fd, response)
     return true
 end

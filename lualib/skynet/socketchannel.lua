@@ -5,6 +5,15 @@
 --   - 认证流程（desc.auth）
 --   - 过载（发送缓冲积压）通知
 --  常用于数据库/外部服务连接（mysql/redis/mongo 等）。
+--
+--  流程概览：
+--   channel:request(request, response[, padding])
+--    → block_connect（若未连接，建立连接/等待正在连接）
+--    → push_response（登记等待者：会话模式登记 session->co；顺序模式入队）
+--    → 写入请求（socket.write/lsend）
+--    → wait_for_response（当前协程挂起）
+--    → 分发线程（会话/顺序）从 socket 读取并解析，通过 __result/__result_data 唤醒等待者
+--   自动重连：连接断开时 close_channel_socket，所有等待者以 socket_error 唤醒；try_connect 循环重试
 local skynet = require "skynet"
 local socket = require "skynet.socket"
 local socketdriver = require "skynet.socketdriver"
@@ -109,6 +118,7 @@ end
 
 local function dispatch_by_session(self)
 	-- 会话模式：desc.response 负责从流中解析一条响应及其 session
+	-- 流程：循环读取 → pcall(response) → 定位等待的 co → 写入 __result/__result_data → wakeup
 	local response = self.__response
 	-- response() return session
 	while self.__sock do
@@ -276,7 +286,16 @@ local function term_dispatch_thread(self)
 end
 
 local function connect_once(self)
-	-- 单次连接流程：应用 nodelay/overload 回调，重启分发协程
+	-- 单次连接流程：应用 nodelay/overload 回调，重启分发协程（核心收敛点）：
+	--  1) 初始化待尝试地址列表：primary（__host:__port）→ backup（去重）
+	--  2) 逐个地址尝试 socket.open；成功后：
+	--     - 应用 nodelay
+	--     - 注册 overload（warning）回调（若提供）
+	--     - 等待旧分发线程退出（顺序模式通过 push close 信号）
+	--     - 创建新的分发线程：会话模式 dispatch_by_session；顺序模式 dispatch_by_order
+	--     - 将 __sock 置为 {fd}
+	--  3) 若失败：
+	--     - 若 once 模式：返回错误信息；否则由 try_connect 外层重试
 	if self.__closed then
 		return false
 	end
@@ -378,6 +397,7 @@ local function connect_once(self)
 
 		if self.__auth then
 			self.__authcoroutine = coroutine.running()
+			-- 认证阶段：可能读写 socket 并 yield，期间连接断开需要回收并可能重试
 			local ok , message = pcall(self.__auth, self)
 			if not ok then
 				close_channel_socket(self)
@@ -394,7 +414,7 @@ local function connect_once(self)
 				end
 				-- auth succ, go through
 			else
-				-- auth failed, try next addr
+				-- auth failed, try next addr 认证失败：尝试下一个地址（备份列表可能在 auth 中动态扩充）
 				_add_backup()	-- auth may add new backup hosts
 				addr = _next_addr()
 				if addr == nil then
@@ -412,6 +432,8 @@ local function connect_once(self)
 end
 
 local function try_connect(self , once)
+	-- 自动重连循环：
+	--  - 失败后指数回退式 sleep（步进 100 tick，上限 1000），打印日志辅助排查
 	local t = 0
 	while not self.__closed do
 		local ok, err = connect_once(self)
@@ -464,7 +486,13 @@ local function check_connection(self)
 end
 
 local function block_connect(self, once)
-	-- 多协程竞争连接：首个协程负责连接，其余协程排队等待；连接完成后统一唤醒
+	-- 多协程竞争连接：
+	--  - 若已连/认证中：直接返回 true
+	--  - 若已关闭：返回 false
+	--  - 否则：
+	--     1) 第一个进入的协程负责 try_connect；其余协程加入 __connecting 并 wait
+	--     2) 连接完成或失败后，唤醒所有等待者，大家统一复查连接状态
+	-- 返回：true（已连或认证中）、false（关闭）、nil（连接失败需抛错）
 	local r = check_connection(self)
 	if r ~= nil then
 		return r
@@ -504,6 +532,7 @@ end
 
 local function wait_for_response(self, response)
 	-- 将当前协程压入等待队列，等待响应解析流程唤醒
+	-- 会话模式：response=会话号；顺序模式：response=解析函数
 	local co = coroutine.running()
 	push_response(self, response, co)
 	skynet.wait(co)
@@ -558,7 +587,7 @@ function channel:request(request, response, padding)
 	end
 
 	if response == nil then
-		-- no response
+		-- no response：仅发送请求，无需等待分发线程唤醒
 		return
 	end
 
@@ -580,6 +609,7 @@ function channel:close()
 end
 
 function channel:changehost(host, port)
+	-- 切换主地址：会在下次请求前触发重连（close 当前 socket）
 	self.__host = host
 	if port then
 		self.__port = port

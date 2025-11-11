@@ -22,6 +22,32 @@ local socket_pool = setmetatable( -- store all socket object
 local socket_onclose = {}   -- fd -> onclose 回调（close 后回调）
 local socket_message = {}   -- socket 协议的分发表（由 C 层回调触发）
 
+-- 流程总览（TCP）：
+-- 1) 连接建立：
+--    - 主动 socket.open → connect(id) → suspend 等待 → socket_message[2] 触发 → s.connected=true → 唤醒
+--    - 监听 socket.listen → suspend 等待 → socket_message[2] 中 listen 分支赋 s.addr/s.port → 唤醒
+-- 2) 数据到达：socket_message[1]
+--    - push 数据入缓冲 → 根据 read_required 判断是否满足 → 唤醒读协程（wakeup）
+--    - 超过 BUFFER_LIMIT 触发 pause_socket 暂停读，待协程切换/消费后 resume
+-- 3) 错误/关闭：socket_message[5]/[3]
+--    - ERROR：记录 connecting 错误/标记 connected=false，shutdown 并唤醒等待者
+--    - CLOSE：回调 onclose（若有）并唤醒等待者
+-- 4) 写入：socket.write/socket.lwrite 直接调用底层 driver 发送
+-- 5) 所有权让渡：socket.abandon 将 fd 移交他服，由新服务 socket.start(id) 接管
+
+-- 读状态机要点（read_required 的不同取值）：
+--  - nil    ：无等待者；收到数据仅入缓冲，若超限触发 pause
+--  - 0      ：任意数据即可唤醒（用于 block / read(nil) 等）
+--  - number ：需要累计到指定字节数才唤醒（用于 read(sz)）
+--  - string ：行分隔符，driver.readline(buffer, pool, sep) 返回非 nil 时唤醒（用于 readline）
+--  - true   ：读取到连接关闭（CLOSE）后唤醒（用于 readall）
+-- 返回值约定：
+--  - 读取成功：返回字符串数据
+--  - 连接关闭：返回 false, 剩余缓冲（可能为空串）
+-- 背压策略：
+--  - driver.push 返回的缓冲大小超过 BUFFER_LIMIT 即 pause_socket（暂停底层读），
+--    待上层协程切换/读取后，在 suspend 中 driver.start 恢复
+
 local function wakeup(s)
 	local co = s.co
 	if co then
@@ -447,6 +473,9 @@ end
 
 -- abandon use to forward socket id to other service
 -- you must call socket.start(id) later in other service
+-- 将一个 fd 的所有权让渡到其他服务：
+--  - 典型用于 gate/agent 之间转移连接所有权的场景
+--  - 放弃后本服务不再持有该 fd 的 socket 对象，需要在新服务中调用 socket.start(id)
 function socket.abandon(id)
 	local s = socket_pool[id]
 	if s then
@@ -505,18 +534,25 @@ function socket.udp_dial(addr, port, callback)
 	return id
 end
 
+-- UDP 发送接口（注意 UDP 不支持 socket.write）：
+--  - sendto(id, addr, data) 发送数据，其中 addr 可通过 udp_address(host,port) 构造
+--  - 若已调用 udp_connect 设置默认地址，addr 仍需显式传入
 socket.sendto = assert(driver.udp_send)
 socket.udp_address = assert(driver.udp_address)
 socket.netstat = assert(driver.info)
 socket.resolve = assert(driver.resolve)
 
 function socket.warning(id, callback)
+    -- 注册发送队列积压回调：
+    --  - 当底层发现写缓冲积压时，会回调 on_warning(id, sizeK)
+    --  - 可用于触发限流/断连保护
 	local obj = socket_pool[id]
 	assert(obj)
 	obj.on_warning = callback
 end
 
 function socket.onclose(id, callback)
+    -- 注册连接关闭回调：当 SOCKET_TYPE_CLOSE 触发时回调
 	socket_onclose[id] = callback
 end
 

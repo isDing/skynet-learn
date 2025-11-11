@@ -1,3 +1,11 @@
+-- 说明：
+--  http.websocket 提供 WebSocket 客户端与服务端的握手与帧读写：
+--   - 客户端：connect(url) → write_handshake → read/write 数据帧
+--   - 服务端：accept(fd, handle, protocol, addr, options) → read_handshake → 循环 resolve_accept
+--   - 帧处理：文本(text)/二进制(binary)/控制帧(ping/pong/close)，支持分片帧聚合
+--   - 掩码（mask）逻辑：客户端帧按标准应使用 mask；服务端帧不使用 mask
+--  注意：本实现对“是否必须 mask”不做强制，write_frame 可通过传入 masking_key 实现标准兼容
+--  参考 RFC6455：MAX_FRAME_SIZE 默认 256KB，过大帧将报错
 local internal = require "http.internal"
 local socket = require "skynet.socket"
 local crypt = require "skynet.crypt"
@@ -23,6 +31,7 @@ local M = {}
 
 
 local ws_pool = {}
+-- 关闭并从 ws_pool 移除，防止后续读写
 local function _close_websocket(ws_obj)
     local id = ws_obj.id
     assert(ws_pool[id] == ws_obj)
@@ -34,6 +43,7 @@ local function _isws_closed(id)
     return not ws_pool[id]
 end
 
+-- 将升级响应中剩余的 payload 注入自定义 read，实现无缝后续读取
 local function reader_with_payload(self, payload)
     local sz_payload = #payload
     if sz_payload == 0 then
@@ -56,6 +66,7 @@ local function reader_with_payload(self, payload)
     end
 end
 
+-- 客户端握手：发送 GET + Upgrade，并校验 101/Upgrade/Connection/Sec-WebSocket-Accept
 local function write_handshake(self, host, url, header)
     local key = crypt.base64encode(crypt.randomkey()..crypt.randomkey())
     local request_header = {
@@ -98,6 +109,7 @@ local function write_handshake(self, host, url, header)
     end
 end
 
+-- 服务端握手读取：校验 Upgrade/Connection/Key/Version，并写回 101 响应
 local function read_handshake(self, upgrade_ops)
     local header, method, url
     if upgrade_ops then
@@ -185,6 +197,7 @@ local function read_handshake(self, upgrade_ops)
     return nil, header, url
 end
 
+-- 安全触发用户 handle[method] 回调
 local function try_handle(self, method, ...)
     local handle = self.handle
     local f = handle and handle[method]
@@ -208,6 +221,7 @@ local op_code = {
     [0x0A]     = "pong",
 }
 
+-- 写帧：按长度编码，按需写入掩码并对 payload 掩码
 local function write_frame(self, op, payload_data, masking_key)
     payload_data = payload_data or ""
     local payload_len = #payload_data
@@ -238,6 +252,7 @@ local function write_frame(self, op, payload_data, masking_key)
 end
 
 
+-- 解析 close 帧：返回 code, reason
 local function read_close(payload_data)
     local code, reason
     local payload_len = #payload_data
@@ -249,6 +264,7 @@ local function read_close(payload_data)
 end
 
 
+-- 读帧：解析长度/掩码并读取 payload；server 模式限制最大帧大小
 local function read_frame(self)
     local s = self.read(2)
     local v1, v2 = string.unpack("I1I1", s)
@@ -280,6 +296,7 @@ local function read_frame(self)
 end
 
 
+-- 服务端接入主循环：握手成功后持续读取帧，处理 ping/pong/close 与分片
 local function resolve_accept(self, options)
     try_handle(self, "connect")
     local code, err, url = read_handshake(self, options and options.upgrade)
@@ -337,6 +354,7 @@ end
 
 
 local SSLCTX_CLIENT = nil
+-- 构造客户端 WS I/O（ws 明文 / wss 走 TLS）
 local function _new_client_ws(socket_id, protocol, hostname)
     local obj
     if protocol == "ws" then
@@ -378,6 +396,7 @@ end
 
 
 local SSLCTX_SERVER = nil
+-- 构造服务端 WS I/O（ws 明文 / wss 走 TLS，需证书）
 local function _new_server_ws(socket_id, handle, protocol)
     local obj
     if protocol == "ws" then
@@ -426,6 +445,7 @@ end
 
 -- handle interface
 -- connect / handshake / message / ping / pong / close / error
+-- 服务端 accept：可兼容 HTTP upgrade；绑定 warning 回调用于背压提示
 function M.accept(socket_id, handle, protocol, addr, options)
     if not (options and options.upgrade) then
         local isok, err = socket.start(socket_id)
@@ -436,6 +456,7 @@ function M.accept(socket_id, handle, protocol, addr, options)
     protocol = protocol or "ws"
     local ws_obj = _new_server_ws(socket_id, handle, protocol)
     ws_obj.addr = addr
+    -- 若上层提供 warning 回调：将其绑定为 socket 写缓冲积压时的通知
     local on_warning = handle and handle["warning"]
     if on_warning then
         local isok = pcall(socket.warning, socket_id, function(id, sz)
@@ -470,6 +491,7 @@ function M.accept(socket_id, handle, protocol, addr, options)
 end
 
 
+-- 客户端连接：支持 ws/wss；可定制 header（子协议等）
 function M.connect(url, header, timeout)
     local protocol, host, uri = string.match(url, "^(wss?)://([^/]+)(.*)$")
     if protocol ~= "wss" and protocol ~= "ws" then
@@ -491,7 +513,7 @@ function M.connect(url, header, timeout)
     local socket_id = sockethelper.connect(host_addr, host_port, timeout)
     local ws_obj = _new_client_ws(socket_id, protocol, hostname)
     ws_obj.addr = host
-    
+    -- 握手期间可能抛 socket_error：统一 _close_websocket 以避免资源泄漏
     local is_ok,err = pcall(write_handshake, ws_obj, host_addr, uri, header)
     if not is_ok then
         _close_websocket(ws_obj)
@@ -501,6 +523,7 @@ function M.connect(url, header, timeout)
 end
 
 
+-- 读取一条完整消息（自动聚合分片）；遇 close 返回 false
 function M.read(id)
     local ws_obj = assert(ws_pool[id])
     local recv_buf
@@ -527,6 +550,7 @@ function M.read(id)
 end
 
 
+-- 写一条消息：fmt=text/binary；可传 masking_key 以满足客户端掩码要求
 function M.write(id, data, fmt, masking_key)
     local ws_obj = assert(ws_pool[id])
     fmt = fmt or "text"
@@ -535,21 +559,25 @@ function M.write(id, data, fmt, masking_key)
 end
 
 
+-- 发送 ping 控制帧
 function M.ping(id)
     local ws_obj = assert(ws_pool[id])
     write_frame(ws_obj, "ping")
 end
 
+-- 获取远端地址（握手阶段记录）
 function M.addrinfo(id)
     local ws_obj = assert(ws_pool[id])
     return ws_obj.addr
 end
 
+-- 若部署在反向代理后，从握手头读取 x-real-ip
 function M.real_ip(id)
     local ws_obj = assert(ws_pool[id])
     return ws_obj.real_ip
 end
 
+-- 主动关闭：可带 code/reason；总能保证资源清理
 function M.close(id, code ,reason)
     local ws_obj = ws_pool[id]
     if not ws_obj then

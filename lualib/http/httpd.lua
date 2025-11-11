@@ -1,3 +1,13 @@
+-- 说明：
+--  httpd 提供最小化的 HTTP 服务器编解码：
+--   - read_request(readfunc, bodylimit?) 读取完整请求，支持 chunked 与 identity
+--   - write_response(writefunc, statuscode, bodyfunc|string|nil, header_table)
+--  常配合 http.sockethelper/readfunc 与 socket.write 实现简单 HTTP 服务。
+--  使用要点：
+--   - read_request 返回 (code, url, method, header, body)；code 非 200 代表错误
+--   - bodylimit 可限制请求体大小，超限返回 413
+--   - write_response 的 body 可为 string（一次性）或 function（chunked 流）或 nil
+--   - 返回值为 ok, err（pcall 包装），避免将异常抛到上层
 local internal = require "http.internal"
 
 local string = string
@@ -53,6 +63,12 @@ local http_status_msg = {
 	[505] = "HTTP Version not supported",
 }
 
+-- 读取并解析一条 HTTP 请求，返回 (code, url, method, header, body)
+--  - code 非 200 表示错误（状态码）
+--  - 支持 transfer-encoding: chunked 与 content-length
+-- 读取并解析一条 HTTP 请求的内部实现：
+--  - readbytes: 函数，读取若干字节；由 http.sockethelper.readfunc(fd) 提供
+--  - bodylimit: number|nil，限制非 chunked 模式下的 Content-Length
 local function readall(readbytes, bodylimit)
 	local tmpline = {}
 	local body = internal.recvheader(readbytes, tmpline, "")
@@ -77,17 +93,19 @@ local function readall(readbytes, bodylimit)
 	local mode = header["transfer-encoding"]
 	if mode then
 		if mode ~= "identity" and mode ~= "chunked" then
+			-- 服务器端仅支持 identity 与 chunked 两种传输编码
 			return 501	-- Not Implemented
 		end
 	end
 
 	if mode == "chunked" then
+		-- chunked：逐块读取直到 size=0，随后解析 trailer 合并到 header
 		body, header = internal.recvchunkedbody(readbytes, bodylimit, header, body)
 		if not body then
 			return 413
 		end
 	else
-		-- identity mode
+		-- identity mode 按 content-length 读取完整体
 		if length then
 			if bodylimit and length > bodylimit then
 				return 413
@@ -113,6 +131,17 @@ function httpd.read_request(...)
 	end
 end
 
+-- 写出一个 HTTP 响应：
+--  - bodyfunc 可为 string（一次性）或 function（chunked 流）或 nil（无正文）
+--  - header 为 kv 表，value 可为字符串或数组
+-- 写出一个 HTTP 响应：
+--  - writefunc: 函数，发送字符串到 socket；常用 http.sockethelper.writefunc(fd)
+--  - statuscode: 数字状态码（200/404/...）
+--  - bodyfunc: string | function | nil
+--      string   -> 设置 content-length 并一次性写出
+--      function -> 采用 chunked 编码，函数每次返回一段数据（"" 允许，nil 结束）
+--      nil      -> 仅写出 header
+--  - header: table，k/v 头部；若 v 为数组则输出多行
 local function writeall(writefunc, statuscode, bodyfunc, header)
 	local statusline = string.format("HTTP/1.1 %03d %s\r\n", statuscode, http_status_msg[statuscode] or "")
 	writefunc(statusline)
@@ -132,6 +161,9 @@ local function writeall(writefunc, statuscode, bodyfunc, header)
 		writefunc(string.format("content-length: %d\r\n\r\n", #bodyfunc))
 		writefunc(bodyfunc)
 	elseif t == "function" then
+		-- 按 chunked 编码逐块写出：
+		--  每个块格式为：CRLF + hexlen + CRLF + data
+		--  结束块格式为：CRLF + 0 + CRLF + CRLF
 		writefunc("transfer-encoding: chunked\r\n")
 		while true do
 			local s = bodyfunc()
