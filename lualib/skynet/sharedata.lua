@@ -48,22 +48,28 @@ function sharedata.query(name)
 	return r
 end
 
--- 创建/覆盖一个共享对象
+-- 创建/覆盖一个共享对象：
+--  - name: 对象名
+--  - v: table | string（@file 或 chunk） | nil（空表）
+--  - ...: 传递给 chunk 的参数
 function sharedata.new(name, v, ...)
 	skynet.call(service, "lua", "new", name, v, ...)
 end
 
--- 更新共享对象（生成新版本）
+-- 更新共享对象（生成新版本）：
+--  - sharedatad 会创建新版本对象，并通过 monitor 通知订阅者
 function sharedata.update(name, v, ...)
 	skynet.call(service, "lua", "update", name, v, ...)
 end
 
--- 删除共享对象
+-- 删除共享对象：
+--  - 订阅者 monitor 会被唤醒（返回 true），后续 query 同名需先 new
 function sharedata.delete(name)
 	skynet.call(service, "lua", "delete", name)
 end
 
--- 主动清理本地缓存代理的内部结构并触发 GC
+-- 主动清理本地缓存代理的内部结构并触发 GC：
+--  - 调用 sd.flush(obj) 释放代理内部引用，随后触发一次 Lua GC
 function sharedata.flush()
 	for name, obj in pairs(cache) do
 		sd.flush(obj)
@@ -71,7 +77,9 @@ function sharedata.flush()
 	collectgarbage()
 end
 
--- 拷贝共享对象的当前版本数据（深拷贝到普通 Lua 表）
+-- 拷贝共享对象的当前版本数据（深拷贝到普通 Lua 表）：
+--  - 若对象已在 cache 中：取其 __obj 作为 C 指针执行 sd.copy
+--  - 否则先 query 再 confirm 以减少服务端引用
 function sharedata.deepcopy(name, ...)
 	if cache[name] then
 		local cobj = cache[name].__obj

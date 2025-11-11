@@ -285,42 +285,57 @@ datacenter.set("game", "drop_rate", 2.0)
 
 ### 3.1 共享数据设计
 
-ShareData用于多个服务共享只读配置数据，采用零拷贝技术：
+ShareData用于多个服务共享只读配置数据，采用“读侧零拷贝 + 服务端增量更新”的设计：
 
 ```lua
--- lualib/skynet/sharedata.lua
+-- lualib/skynet/sharedata.lua（节选）
+local skynet = require "skynet"
+local sd = require "skynet.sharedata.corelib"
 local sharedata = {}
-local cache = setmetatable({}, {__mode = "kv"})
+local cache = setmetatable({}, { __mode = "kv" })
+local service
 
-function sharedata.query(name)
-    if cache[name] then
-        return cache[name]
+-- 初始化：定位唯一 sharedatad 服务
+skynet.init(function()
+    service = skynet.uniqueservice "sharedatad"
+end)
+
+-- 后台监控：收到新版本指针时，对本地代理对象做增量更新
+local function monitor(name, obj, cobj)
+    local newobj = cobj
+    while true do
+        newobj = skynet.call(service, "lua", "monitor", name, newobj)
+        if newobj == nil then break end
+        sd.update(obj, newobj)
+        skynet.send(service, "lua", "confirm" , newobj)
     end
-    
-    -- 从sharedatad获取数据对象
+    if cache[name] == obj then cache[name] = nil end
+end
+
+-- 查询共享对象：返回一个可增量更新的代理对象（读侧零拷贝）
+function sharedata.query(name)
+    if cache[name] then return cache[name] end
     local obj = skynet.call(service, "lua", "query", name)
     if cache[name] and cache[name].__obj == obj then
-        skynet.send(service, "lua", "confirm", obj)
+        skynet.send(service, "lua", "confirm" , obj)
         return cache[name]
     end
-    
-    -- 包装为代理对象
     local r = sd.box(obj)
-    skynet.send(service, "lua", "confirm", obj)
-    
-    -- 启动监控协程
+    skynet.send(service, "lua", "confirm" , obj)
     skynet.fork(monitor, name, r, obj)
     cache[name] = r
     return r
 end
 ```
 
+注意：ShareData 对使用方是只读的，并不提供“写时复制”的用户侧改写能力；更新通过 sharedatad.update 生成新版本，并向所有订阅者下发增量补丁（sd.update）。
+
 ### 3.2 内存共享机制
 
 **核心思想：**
-- 数据存储在sharedatad服务的C内存中
-- 各服务通过Lua userdata引用访问
-- 写时复制（Copy-on-Write）
+- 数据存储在 sharedatad 服务维护的 C 对象中
+- 各服务通过 Lua userdata 的代理读取（读零拷贝）
+- 更新采用“新版本 + 增量补丁”下发（非用户态 Copy-on-Write）
 
 ```lua
 -- service/sharedatad.lua
@@ -334,16 +349,17 @@ function CMD.new(name, t, ...)
     if dt == "table" then
         value = t
     elseif dt == "string" then
-        -- 从文件加载
-        if t:sub(1, 1) == "@" then
-            local f = assert(loadfile(t:sub(2), "bt", value))
+        -- 支持从文件 (@path) 或 chunk（字符串）加载，使用独立环境表 value
+        value = setmetatable({}, env_mt)
+        local f
+        if t:sub(1,1) == "@" then
+            f = assert(loadfile(t:sub(2),"bt",value))
         else
-            local f = assert(load(t, "=" .. name, "bt", value))
+            f = assert(load(t, "=" .. name, "bt", value))
         end
         local _, ret = assert(skynet.pcall(f, ...))
-        if type(ret) == "table" then
-            value = ret
-        end
+        setmetatable(value, nil)
+        if type(ret) == "table" then value = ret end
     end
     
     -- 创建C对象
@@ -681,6 +697,22 @@ local players = db_pool.execute(function(db)
     return db:query("SELECT * FROM players WHERE level > 10")
 end)
 ```
+
+提示：Skynet 官方 DB 模块（mysql/redis/mongo）均已自带连接池或复用机制，若自行实现池化，需注意：
+- 连接的生命周期管理（断线重连、异常回收）
+- 上下文中的事务/会话状态不可跨连接泄漏
+- 对 Redis pipeline/批量命令的结果匹配顺序要严格对应
+
+## 3+. ShareTable（结构共享只读表）
+
+ShareTable 与 ShareData 的目标相同（多服务共享只读数据），但实现方式不同：
+- ShareData：集中式版本管理 + 增量补丁（适合热更新配置）
+- ShareTable：基于共享内存 matrix 的结构共享（适合大体量只读数据，客户端 clone 轻量）
+
+核心 API（lualib/skynet/sharetable.lua）：
+- loadfile/loadstring/loadtable：加载或替换文件/字符串/表对应的 matrix
+- query/queryall：按文件名（或列表）查询指针并在本地 clone 代理
+- update(names...)：在 Lua 世界内做“全局替换”，将旧代理替换为新代理（使用 debug.* 技术，需谨慎）
 
 ## 5. 数据持久化
 

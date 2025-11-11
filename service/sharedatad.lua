@@ -107,6 +107,7 @@ function CMD.query(name)
 end
 
 -- 客户端确认已使用完该对象指针（减少引用计数）
+-- 客户端确认：减少 C 对象的引用计数（与 CMD.query/monitor 成对）
 function CMD.confirm(cobj)
 	if objmap[cobj] then
 		sharedata.host.decref(cobj)

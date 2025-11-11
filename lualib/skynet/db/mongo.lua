@@ -1,3 +1,11 @@
+-- 说明：
+--  skynet.db.mongo 提供 MongoDB 客户端：
+--   - 基于 socketchannel、使用 Mongo wire protocol（见 driver 模块）
+--   - client/getDB/getCollection → insert/find/update/delete/aggregate 等接口
+--   - 提供 cursor/aggregate_cursor 遍历；werror/wbulkerror 处理写结果
+--  注意：
+--   - 与 MySQL 不同，Mongo 使用文档协议；注意数值类型（bson.int64）与 nil 语义
+--   - 写入返回需检查 ok 字段、writeErrors、writeConcernError 等字段
 local bson = require "bson"
 
 require "skynet.socket"

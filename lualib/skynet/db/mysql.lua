@@ -4,6 +4,17 @@
 -- The license is under the BSD license.
 -- Modified by Cloud Wu (remove bit32 for lua 5.3)
 
+-- 说明：
+--  skynet.db.mysql 基于 MariaDB/MySQL 客户端协议实现：
+--   - 使用 socketchannel 管理连接，登录流程：握手包(HSP) → 能力/最大包/字符集/用户名/鉴权 token/默认库 → OK/ERR
+--   - 文本查询：COM_QUERY + SQL → 结果集（列定义 + 行数据）或 OK/ERR
+--   - 预处理语句：COM_STMT_PREPARE/EXECUTE/RESET/CLOSE；参数以二进制形式编码
+--   - 边界：多结果集（SERVER_MORE_RESULTS_EXISTS）、大包分片、字符集映射
+--  使用：
+--   local db = mysql.connect{ host, port, user, password, database, charset }；db:query(sql)；db:prepare/execute(stmt,...)
+--  注意：
+--   - prepare 参数类型区分整数/浮点/字符串/布尔/NULL；执行时数量须等于 param_count
+--   - read_result 返回 { fields, rows } 或 OK 包信息；错误返回 false, err, errno, sqlstate
 -- protocol detail: https://mariadb.com/kb/en/clientserver-protocol/
 
 local socketchannel = require "skynet.socketchannel"
@@ -460,6 +471,11 @@ local function _recv_decode_packet_resp(self)
 end
 
 local function _mysql_login(self, user, password, charset, database, on_connect)
+    -- 登录过程（握手应答）：
+    --  1) 读取服务端握手初始化包，解析 server_version / capability / scramble
+    --  2) 计算鉴权 token（sha1(password) 与 scramble 混合）
+    --  3) 发送客户端能力、最大包、字符集、用户名、token、默认库等，并等待 OK/ERR
+    --  4) on_connect 钩子（可设置会话级变量）
     return function(sockchannel)
         local dispatch_resp = _recv_decode_packet_resp(self)
         local packet = sockchannel:response(dispatch_resp)
@@ -527,18 +543,21 @@ local function _compose_ping(self)
 end
 
 local function _compose_query(self, query)
+    -- 文本查询：COM_QUERY + SQL，包号重置后打包
     self.packet_no = -1
     local cmd_packet = COM_QUERY .. query
     return _compose_packet(self, cmd_packet)
 end
 
 local function _compose_stmt_prepare(self, query)
+    -- 预处理准备：COM_STMT_PREPARE + SQL
     self.packet_no = -1
     local cmd_packet = COM_STMT_PREPARE .. query
     return _compose_packet(self, cmd_packet)
 end
 
 --参数字段类型转换
+-- 预处理参数编码：根据 Lua 类型决定 param_type 与 param_value（二进制）
 local store_types = {
     number = function(v)
         if not tointeger(v) then
@@ -565,6 +584,9 @@ store_types["nil"] = function(v)
 end
 
 local function _compose_stmt_execute(self, stmt, cursor_type, args)
+    -- 执行预处理：
+    --  - cursor_type: 一般使用 NO_CURSOR；
+    --  - args：数量必须等于 stmt.param_count；每个参数按 store_types 序列化
     local arg_num = args.n
     if arg_num ~= stmt.param_count then
         error("require stmt.param_count " .. stmt.param_count .. " get arg_num " .. arg_num)
@@ -612,6 +634,10 @@ local function _compose_stmt_execute(self, stmt, cursor_type, args)
 end
 
 local function read_result(self, sock)
+    -- 读取一次结果集：
+    --  - 可能是 ERR/OK 包
+    --  - 或者：列数 -> 列定义... -> EOF -> 行数据... -> EOF
+    --  - 当 SERVER_MORE_RESULTS_EXISTS 时，调用方需再次 read_result 读取下一个结果集
     local packet, typ, err = _recv_packet(self, sock)
     if not packet then
         return nil, err
@@ -761,6 +787,7 @@ function _M.disconnect(self)
 end
 
 function _M.query(self, query)
+    -- 执行一次文本查询：返回结果集或 OK 信息；失败抛错由调用方接收
     local querypacket = _compose_query(self, query)
     local sockchannel = self.sockchannel
     if not self.query_resp then
@@ -826,6 +853,7 @@ end
 
 -- 注册预处理语句
 function _M.prepare(self, sql)
+    -- 注册一条预处理语句：返回 prepare_id/param/field 等信息
     local querypacket = _compose_stmt_prepare(self, sql)
     local sockchannel = self.sockchannel
     if not self.prepare_resp then
@@ -1052,6 +1080,9 @@ end
         err
 ]]
 function _M.execute(self, stmt, ...)
+    -- 执行预处理语句：
+    --  - stmt 为 prepare 的返回对象
+    --  - 参数严格按 stmt.param_count 传入
     local querypacket, er = _compose_stmt_execute(self, stmt, CURSOR_TYPE_NO_CURSOR, table.pack(...))
     if not querypacket then
         return {
@@ -1076,6 +1107,7 @@ end
 
 --重置预处理句柄
 function _M.stmt_reset(self, stmt)
+    -- 重置预处理语句（清理参数/状态）
     local querypacket = _compose_stmt_reset(self, stmt)
     local sockchannel = self.sockchannel
         if not self.query_resp then
@@ -1093,6 +1125,7 @@ end
 
 --关闭预处理句柄
 function _M.stmt_close(self, stmt)
+    -- 关闭预处理语句句柄
     local querypacket = _compose_stmt_close(self, stmt)
     local sockchannel = self.sockchannel
     return sockchannel:request(querypacket)

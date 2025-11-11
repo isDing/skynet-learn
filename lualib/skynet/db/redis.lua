@@ -1,3 +1,12 @@
+-- 说明：
+--  skynet.db.redis 提供 Redis 协议的最小客户端封装：
+--   - 基于 socketchannel，支持自动连接与 nodelay，响应按 Redis 协议解析
+--   - 命令调用：`db:cmd(args...)` 或 `db:cmd{arg1, arg2, ...}`，自动序列化为 RESP
+--   - pipeline(ops[, resp])：批量请求，支持采集全部响应
+--   - watch 模式：订阅/模式订阅（SUBSCRIBE/PSUBSCRIBE），通过 :message() 读取推送
+--  注意：
+--   - pipeline 的响应顺序与 ops 顺序一致；当 resp=nil 时仅返回最后一条的响应
+--   - watch 模式下对象析构会自动关闭底层连接（__gc）
 local socketchannel = require "skynet.socketchannel"
 
 local tostring = tostring

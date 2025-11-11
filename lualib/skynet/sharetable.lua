@@ -3,6 +3,9 @@
 --   - 通过底层共享内存（matrix）实现多进程共享，减少内存占用
 --   - 支持按文件/字符串/表加载，按文件名查询与版本管理
 --   - 客户端 clone 得到的是轻量代理，不持有数据副本
+--  注意：
+--   - update(names...) 会在 Lua 世界内对引用执行“全局替换”，涉及 debug.* 操作，需谨慎使用
+--   - 如果不需要在运行期替换已有引用，优先使用 loadfile/loadstring 后重新 query 方式
 local skynet = require "skynet"
 local service = require "skynet.service"
 local core = require "skynet.sharetable.core"
